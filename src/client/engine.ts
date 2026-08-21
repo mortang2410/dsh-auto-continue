@@ -663,7 +663,7 @@ interface SessionState {
   /** 我们上次自动发送的文本(用于识别自己的回显)。 */
   lastSentText: string;
   /** 宽限期定时器(进行中的待发送)。 */
-  pendingTimer: number | undefined;
+  pendingTimer: ReturnType<typeof setTimeout> | undefined;
   /** 宿主权威 running 位(来自 host/session-status 与回合事件)。 */
   running: boolean | undefined;
   /** 当前排队消息数(来自 session/queue 帧)。 */
@@ -709,7 +709,7 @@ interface SessionState {
   /** 本回合已触发过 loop guard(防重复打断)。 */
   loopFired: boolean;
   /** loop 重启的延迟定时器(冷却结束后再 schedule)。 */
-  loopRetryTimer: number | undefined;
+  loopRetryTimer: ReturnType<typeof setTimeout> | undefined;
   /** 我们主动 cancel 过本回合(区分用户停止)。 */
   loopCancelled: boolean;
 }

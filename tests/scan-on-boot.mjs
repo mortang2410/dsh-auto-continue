@@ -1,0 +1,87 @@
+import assert from 'node:assert/strict';
+import { mock } from 'node:test';
+import { makeHost, turnEnd } from './host-fixture.mjs';
+
+mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+const flush = async (ms = 0) => {
+  mock.timers.tick(ms);
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+};
+const hosts = [];
+const host = (options) => { const h = makeHost(options); hosts.push(h); return h; };
+try {
+  const h = host();
+  const permanent = h.agent('permanent', [turnEnd(1, 'error', { error: { code: 'AUTH', status: 401, message: 'invalid credentials' } })]);
+  h.start();
+  await flush();
+  assert.equal(h.stats().skipped, 1);
+  await flush(3000);
+  assert.equal(h.stats().skipped, 1, 'a permanent failure is counted only once across startup scans');
+  assert.equal(permanent.reads, 1, 'settled histories are not snapshotted repeatedly');
+  const limited = host({ scanLimit: 1 });
+  limited.agent('recent-completed', [turnEnd(1, 'completed')]);
+  const interrupted = limited.agent('older-interrupted', [{ ...turnEnd(1, 'interrupted'), time: Date.now() - 100 }]);
+  limited.start();
+  await flush();
+  await flush(10);
+  assert.equal(interrupted.followups.length, 1, 'healthy sessions do not consume the recovery limit');
+  const delayed = host();
+  const healthy = delayed.agent('healthy', [turnEnd(1, 'completed')]);
+  delayed.start();
+  const paused = host({ paused: true });
+  paused.start();
+  await flush();
+  const late = delayed.agent('late', [turnEnd(1, 'interrupted')]);
+  const unpaused = paused.agent('unpaused', [turnEnd(1, 'interrupted')]);
+  paused.config.paused = false;
+  await flush(3000);
+  await flush(10);
+  assert.equal(late.followups.length, 1, 'a healthy session does not end polling for later sessions');
+  assert.equal(unpaused.followups.length, 1, 'unpausing still permits startup recovery');
+  assert.equal(healthy.reads, 1);
+
+  const bounded = host({ freshMs: 4000 });
+  bounded.start();
+  await flush();
+  await flush(6000);
+  const readsAtDeadline = bounded.listReads();
+  await flush(6000);
+  assert.equal(bounded.listReads(), readsAtDeadline, 'polling ends when the boot freshness window expires');
+
+  const batches = host({ scanLimit: 1 });
+  const first = batches.agent('first', [turnEnd(1, 'interrupted')]);
+  const second = batches.agent('second', [{ ...turnEnd(1, 'interrupted'), time: Date.now() - 1 }]);
+  batches.start();
+  await flush();
+  await flush(10);
+  assert.equal(first.followups.length, 1);
+  assert.equal(second.followups.length, 0);
+  await flush(3000);
+  await flush(10);
+  assert.equal(second.followups.length, 1, 'remaining eligible sessions are handled on the next pass');
+  assert.equal(first.followups.length, 1, 'a startup marker cannot be sent twice');
+  const empty = host();
+  const loading = empty.agent('loading');
+  empty.start();
+  await flush();
+  loading.session.events.push(turnEnd(1, 'interrupted'));
+  await flush(3000);
+  await flush(10);
+  assert.equal(loading.followups.length, 1, 'an empty initial snapshot may become ready later');
+  const disabled = host();
+  disabled.start();
+  await flush();
+  disabled.config.scanOnBoot = false;
+  const disabledAgent = disabled.agent('disabled', [turnEnd(1, 'interrupted')]);
+  await flush(3000);
+  await flush(10);
+  assert.equal(disabledAgent.followups.length, 0, 'turning off startup scanning takes effect');
+  const beforeDispose = disabled.listReads();
+  disabled.dispose();
+  await flush(3000);
+  assert.equal(disabled.listReads(), beforeDispose, 'unloading stops the poller');
+  console.log('Boot scan deduplication, delayed sessions, pause and bounded polling ✅');
+} finally {
+  for (const h of hosts) h.dispose();
+  mock.timers.reset();
+}

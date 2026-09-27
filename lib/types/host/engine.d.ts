@@ -6,10 +6,11 @@
  * bugs (issue #13) cannot exist by construction. Listens to the session event
  * firehose (`session/event`), sends through the agent registry
  * (`agent.followup`), cancels through `agent.cancel`, and reads configuration
- * from the settings service.
+ * injected by the entry (`apply`'s config argument, merged with schema
+ * defaults by `resolveConfig`).
  *
- * All behavior is driven by the `auto-continue` settings namespace (see the
- * plugin's settings card); every knob below is user-configurable there.
+ * All behavior is driven by the `auto-continue` entry config; every knob below
+ * is user-configurable there.
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
@@ -36,11 +37,16 @@ export declare class AutoContinueRunner {
     private readonly notices;
     private readonly noticeListeners;
     private readonly stateListeners;
+    private readonly prioritizedFollowups;
     private readonly disposeSessionEvents;
+    private readonly disposeInboxEvents;
     private disposed;
+    private readonly bootScannedSessions;
+    private bootScanTimer;
+    private wakeBootScan;
     /**
-     * @param ctx - host plugin context (agents registry, session events, settings).
-     * @param getConfig - read the current resolved configuration (settings service).
+     * @param ctx - host plugin context (agents registry, session events).
+     * @param getConfig - read the current resolved configuration (entry config).
      */
     constructor(ctx: Context, getConfig: () => AutoContinueConfig);
     private log;
@@ -117,12 +123,7 @@ export declare class AutoContinueRunner {
     /** 上一步工具调用的护栏状态(实时路径, 由 mux 帧维护)。 */
     private currentGuard;
     private bootScanLoop;
-    /** 反复尝试扫描, 直到成功(宿主就绪)或达到次数上限。 */
-    private scanLoop;
-    /**
-     * 扫描最近中断过的会话: 最后回合以非人为原因结束, 且其后没有新回合或用户消息。
-     * @returns 是否成功完成一次扫描(宿主就绪)。
-     */
+    /** Inspect newly available sessions; process each settled startup history once. */
     private scanInterrupted;
     /** 从历史事件恢复上一步工具调用状态(扫描路径的幂等护栏)。 */
     private applyGuardFromEvents;

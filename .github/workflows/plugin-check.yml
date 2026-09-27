@@ -30,6 +30,11 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Verify published DSH 0.1.7 settings integration
+        run: |
+          npm ci --prefix tests/fixtures/dsh-0.1.7 --no-audit --no-fund
+          npm run test:runtime
+
       - name: Verify committed build artifacts
         run: git diff --exit-code -- lib
 

@@ -58,11 +58,11 @@ export interface AutoContinueSettings {
   cooldownMs?: number;
   /** Max consecutive auto-continues per session before stopping. */
   maxConsecutive?: number;
-  /** Scan recently interrupted sessions on page load / reconnect. */
+  /** Recover delayed interrupted sessions during the host startup window. */
   scanOnBoot?: boolean;
-  /** Max sessions the scan checks (most recently updated). */
+  /** Max eligible recoveries per scan pass (most recently active first). */
   scanLimit?: number;
-  /** Scan only considers interruptions inside this window (ms). */
+  /** Interruption freshness and duration of startup polling (ms). */
   freshMs?: number;
   /** Log `[auto-continue]` lines to the browser console. */
   verbose?: boolean;

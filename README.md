@@ -61,13 +61,13 @@ It watches the live event streams and reacts to:
 | `turn/end` → `completed` / `no-visible-output` with no visible output | Turn ended normally with reasoning only: no text, no tool call |
 | `host/agent-error` | Agent failure with no turn position (only network/timeout-class messages auto-resume) |
 
-**Never auto-continues:** user-aborted turns (`aborted`) or policy rejections (`blocked`); live `interrupted` turn-ends too — that marker is only written by crash repair when the host reloads, so orphaned turns are recovered by the startup scan, not the live path; sessions the host already resumed itself; running sessions or sessions with queued messages; subagent sessions; anything inside the cooldown / consecutive-cap windows (configurable in the settings card, below).
+**Never auto-continues:** user-aborted turns (`aborted`) or policy rejections (`blocked`); live `interrupted` turn-ends too — that marker is only written by crash repair when the host reloads, so orphaned turns are recovered by the startup scan, not the live path; sessions the host already resumed itself; running sessions; subagent sessions; anything inside the cooldown / consecutive-cap windows (configurable in the settings card, below). If an interrupted session already has queued turns, the continuation runs first and the existing turns retain their order behind it.
 
 ---
 
 ## How It Works
 
-The host-side engine subscribes to the session event firehose inside the dsh host process — exactly one engine, regardless of how many tabs are open (the duplicate-send class of bugs cannot exist by construction). On an interruption it waits a **grace period** (default 3 s) — if the host starts a new turn by itself (`turn/start`), the auto-continue is cancelled — then sends the configured text through the agent registry (`agent.followup`, the same queue the Send button uses).
+The host-side engine subscribes to the session event firehose inside the dsh host process — exactly one engine, regardless of how many tabs are open (the duplicate-send class of bugs cannot exist by construction). On an interruption it waits a **grace period** (default 3 s) — if the host starts a new turn by itself (`turn/start`), the auto-continue is cancelled — then sends the configured text through the agent registry (`agent.followup`, the same queue the Send button uses). When that queue already contains turns, the engine promotes only its newly inserted continuation before the host wakes the agent; it does not remove or reorder the queued user turns.
 
 On host boot it also scans the live sessions: a session whose last turn ended with a non-human reason **within the scan window** (default 15 minutes), with no later `turn/start` or user message, gets resumed automatically too (e.g. the host crashed while the browser was closed — the agent-loop resumes the session and the engine picks it up).
 
@@ -84,6 +84,10 @@ The diagram summarizes the automatic recovery path, the loop-guard restart path,
 DSH plugins install into a **profile** (`dsh web` → `web` profile). Install, restart `dsh web`, done.
 
 > **Use the latest DSH (recommended: 0.1.2-alpha.4 or newer).** Run `dsh --version` before installing. Plugin v0.11.1 supports the settings API used by DSH 0.1.2-alpha.2+ (including alpha.3 and alpha.4) while retaining compatibility with DSH 0.1.0-rc.7 through 0.1.1; rc.6 and earlier remain unsupported (`list slot ... requires options.id`). Preview releases may appear on the [official DSH releases page](https://github.com/deepseek-ai/deepseek-harness/releases) before the public npm tag catches up.
+
+Plugin v0.11.9 drops the host engine's dependency on the legacy `settings` register/get namespace: entry config is injected directly via `apply(ctx, config)` and merged with schema defaults, fixing the host-half startup failure on the newer settings API (the client's `configForms` support is unchanged).
+
+Plugin v0.11.8 also supports DSH 0.1.7-alpha.2's `configForms` API. Open **Plugins → dsh-client-auto-continue** for its settings; older DSH versions retain **Settings → Plugins**. This fixes the startup error `pending (waiting for service: settingsScope)` on the newer API.
 
 ### From npm (recommended)
 
@@ -159,7 +163,9 @@ Everything is configurable from the GUI — no file or console edits needed. Ope
 
 The settings card groups controls by handoff, safety, recovery, loop breaking, and live status. Its header also keeps the open-source repository and a **Star on GitHub** shortcut within reach.
 
-**Or skip the GUI and edit the config file directly** — the engine reads the plugin's section from `~/.dsh/settings.yaml` (one shared file for every plugin's sections), so this works in any install, patched or not. The file is watched and re-read automatically, so changes apply live; restart `dsh web` if a page that was already open doesn't pick them up. Fields you leave out fall back to the defaults in the table below.
+DSH 0.1.7 stores these values in the `auto-continue` entry's config in the active profile patch. The GUI applies edits live without restarting the engine. Older hosts use the `auto-continue` section in `~/.dsh/settings.yaml`; the YAML example below shows that legacy format. Omitted fields use the defaults below.
+
+Startup recovery polls every three seconds for sessions that load late, up to `freshMs` after the engine starts. Each settled session history is inspected once. `scanLimit` limits eligible recoveries per pass, so healthy or permanent-error sessions cannot crowd out interrupted ones. Pausing suspends recovery within the same window; unloading cancels the poller.
 
 The browser mirrors DSH's active language into the internal `locale` field. Leave the five localized text fields empty or omit them to follow that language automatically; any non-empty value is treated as your own template and is never rewritten when the language changes:
 
@@ -202,7 +208,7 @@ auto-continue:
 - Boolean fields are **tri-state**: *Inherit* (use the default) / *On* / *Off*
 - Invalid drafts (non-numbers, values below the minimum) block the save with a hint
 - In a read-only deployment the card shows the stored values but disables every control
-- Changes apply immediately after Save and persist in `~/.dsh/settings.yaml` (uninstalling the plugin leaves the section behind — harmless, delete it by hand if you like)
+- Changes apply immediately after Save and persist in the active profile config (or `~/.dsh/settings.yaml` on older hosts)
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -224,9 +230,9 @@ auto-continue:
 | Grace period (ms) | `3000` | Wait after an interruption; cancelled if the host recovers on its own |
 | Cooldown (ms) | `20000` | Min interval between auto-continues per session (failed attempts count too) |
 | Max consecutive | `3` | Max consecutive auto-continues; stops until a user intervenes or a turn completes with visible output |
-| Scan on load / reconnect | `on` | Scan recently interrupted sessions on load / reconnect |
-| Scan limit | `8` | Max sessions scanned (running / subagent sessions excluded) |
-| Scan window (ms) | `900000` | Scan only considers interruptions inside this window |
+| Scan on host startup | `on` | Recover interrupted sessions that become available during the startup window |
+| Scan limit | `8` | Maximum eligible recoveries per pass, most recently active first |
+| Scan window (ms) | `900000` | Maximum interruption age and duration of startup polling |
 | Verbose logs | `on` | `[auto-continue]` console logs |
 | Classify errors | `on` | Auto-resume transient failures only; auth / balance / model errors are skipped and notified |
 | Custom retryable errors | empty | One case-insensitive literal per line; matching the error code, HTTP status, or message explicitly overrides the built-in classifier |
@@ -261,6 +267,8 @@ The plugin is browser-only and touches **no files, credentials, or network beyon
 
 ## Development
 
+The CI runtime test uses the published DSH 0.1.7 packages to check the HTTP bridge and live settings through the real Loader. Run `npm ci --prefix tests/fixtures/dsh-0.1.7` once, then `npm run test:runtime` after building.
+
 ```bash
 npm run typecheck   # tsc --noEmit
 npm run build       # lib/client.js + lib/index.js + lib/types
@@ -270,7 +278,7 @@ npm run test        # node tests/simulate-host.mjs — 15 host-side behavioral s
 
 While `npm run watch` runs, the profile's client-hmr row polls `lib/client.js` every 500 ms and hot-reloads the plugin in the browser — no server restart needed for code changes.
 
-CI installs from the lockfile, typechecks, rebuilds and verifies committed artifacts, runs the host and dual-layout client simulations, then runs [dsh-plugin-check](https://github.com/omdsh-dev/dsh-plugin-check). The same health check gates releases.
+CI installs from the lockfile, typechecks, rebuilds and verifies committed artifacts, runs the host and client simulations (including legacy settings scopes and DSH 0.1.7 configuration forms through Cordis), then runs [dsh-plugin-check](https://github.com/omdsh-dev/dsh-plugin-check). The same health check gates releases.
 
 ---
 

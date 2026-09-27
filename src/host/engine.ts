@@ -6,10 +6,11 @@
  * bugs (issue #13) cannot exist by construction. Listens to the session event
  * firehose (`session/event`), sends through the agent registry
  * (`agent.followup`), cancels through `agent.cancel`, and reads configuration
- * from the settings service.
+ * injected by the entry (`apply`'s config argument, merged with schema
+ * defaults by `resolveConfig`).
  *
- * All behavior is driven by the `auto-continue` settings namespace (see the
- * plugin's settings card); every knob below is user-configurable there.
+ * All behavior is driven by the `auto-continue` entry config; every knob below
+ * is user-configurable there.
  */
 
 import type { Context } from '@deepseek-ai/cordis';
@@ -197,12 +198,17 @@ export class AutoContinueRunner {
   private readonly notices: HostNotice[] = [];
   private readonly noticeListeners = new Set<() => void>();
   private readonly stateListeners = new Set<() => void>();
+  private readonly prioritizedFollowups = new Set<string>();
   private readonly disposeSessionEvents: () => void;
+  private readonly disposeInboxEvents: () => void;
   private disposed = false;
+  private readonly bootScannedSessions = new WeakSet<Session>();
+  private bootScanTimer: ReturnType<typeof setTimeout> | undefined;
+  private wakeBootScan: (() => void) | undefined;
 
   /**
-   * @param ctx - host plugin context (agents registry, session events, settings).
-   * @param getConfig - read the current resolved configuration (settings service).
+   * @param ctx - host plugin context (agents registry, session events).
+   * @param getConfig - read the current resolved configuration (entry config).
    */
   constructor(
     private readonly ctx: Context,
@@ -215,6 +221,37 @@ export class AutoContinueRunner {
       } catch (error) {
         console.error(
           `[auto-continue] 会话事件处理异常 ${session.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    });
+    // followup() appends before it wakes the driver. Move only this plugin's marked
+    // message during the synchronous insertion event, while the driver still cannot claim it.
+    this.disposeInboxEvents = ctx.on('agent/inbox/inserted', ({ agent, message }) => {
+      if (!this.prioritizedFollowups.delete(message.id)) return;
+      let removed = false;
+      try {
+        const index = agent.inbox.nextTurn.findIndex(pending => pending.id === message.id);
+        if (index <= 0) return;
+        removed = agent.inbox.remove(message.id);
+        if (!removed) return;
+        agent.inbox.prepend('next-turn', message);
+      } catch (error) {
+        // Preserve the continuation even if a host-side queue mutation rejects the move.
+        if (removed) {
+          try {
+            agent.inbox.append('next-turn', message);
+          } catch (rollbackError) {
+            console.error(
+              `[auto-continue] 恢复续跑消息失败 ${agent.id}: ${
+                rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+              }`,
+            );
+          }
+        }
+        console.error(
+          `[auto-continue] 调整续跑消息顺序失败 ${agent.id}: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -293,7 +330,13 @@ export class AutoContinueRunner {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.bootScanTimer !== undefined) clearTimeout(this.bootScanTimer);
+    this.bootScanTimer = undefined;
+    this.wakeBootScan?.();
+    this.wakeBootScan = undefined;
     this.disposeSessionEvents();
+    this.disposeInboxEvents();
+    this.prioritizedFollowups.clear();
     for (const state of this.states.values()) {
       if (state.pendingTimer !== undefined) clearTimeout(state.pendingTimer);
       if (state.loopRetryTimer !== undefined) clearTimeout(state.loopRetryTimer);
@@ -645,7 +688,7 @@ export class AutoContinueRunner {
                 } catch (error) {
                   console.error(`[auto-continue] loop 重启异常 ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
                 }
-              }, remaining);
+              }, remaining + 10); // +10ms: the schedule re-check compares Date.now() against the cooldown; a 1ms wall-clock step can otherwise make it read just under, silently dropping the restart
               this.log(`loop 重启延迟 ${remaining}ms(冷却期) ${sessionId}`);
             } else {
               this.schedule(sessionId, 'loop:aborted');
@@ -904,7 +947,7 @@ export class AutoContinueRunner {
     // 模板填充: continueText 可含 {code}/{message}/{status}/{tool}/{turn}/{errorCount}/{sessionTitle}/{elapsed} 占位符
     const template = this.templateFor(config, reason);
     const text = this.buildContinueText(config, state, template);
-    // 发送: agent.followup 是排队语义(运行中会排入 inbox, 不会打断), 天然安全
+    // 发送: followup 负责唤醒; 同步 inbox 插入事件会在唤醒前把本消息移到已有队列之前。
     const agent = this.ctx.agents.get(sessionId);
     if (agent === undefined) {
       this.log(`跳过 ${sessionId}(${reason}): 无 live agent`);
@@ -918,11 +961,14 @@ export class AutoContinueRunner {
       });
       // `followup` may publish the matching session event synchronously.
       trackPendingEcho(state, message.id);
+      if (agent.inbox.nextTurn.length > 0) this.prioritizedFollowups.add(message.id);
       try {
         agent.followup(message);
       } catch (error) {
         forgetPendingEcho(state, message.id);
         throw error;
+      } finally {
+        this.prioritizedFollowups.delete(message.id);
       }
       const now = Date.now();
       state.consecutive += 1;
@@ -995,12 +1041,11 @@ export class AutoContinueRunner {
   }
 
   private async bootScanLoop(): Promise<void> {
-    await this.scanLoop(Infinity, 3000);
-  }
-
-  /** 反复尝试扫描, 直到成功(宿主就绪)或达到次数上限。 */
-  private async scanLoop(attempts: number, delayMs: number): Promise<void> {
-    for (let attempt = 0; attempt < attempts && !this.disposed; attempt += 1) {
+    // Sessions restored after this window are too old for startup recovery.
+    // Keep polling only within that window, including while globally paused.
+    const deadline = Date.now() + this.getConfig().freshMs;
+    for (let attempt = 0; !this.disposed; attempt += 1) {
+      if (attempt > 0 && Date.now() >= deadline) return;
       try {
         if (await this.scanInterrupted()) return;
       } catch (error) {
@@ -1008,100 +1053,104 @@ export class AutoContinueRunner {
         // 宿主未就绪时每 3s 重试; 只节流记录日志, 避免刷屏。
         if (attempt % 10 === 0) {
           this.log(
-            `扫描失败(${attempt + 1}/${attempts === Infinity ? '∞' : attempts}): ${
+            `扫描失败(${attempt + 1}): ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
         }
       }
-      if (attempt + 1 < attempts) await sleep(delayMs);
+      const remaining = deadline - Date.now();
+      if (this.disposed || remaining <= 0) return;
+      await new Promise<void>((resolve) => {
+        this.wakeBootScan = resolve;
+        this.bootScanTimer = setTimeout(() => {
+          this.bootScanTimer = undefined;
+          this.wakeBootScan = undefined;
+          resolve();
+        }, Math.min(3000, remaining));
+      });
     }
   }
 
-  /**
-   * 扫描最近中断过的会话: 最后回合以非人为原因结束, 且其后没有新回合或用户消息。
-   * @returns 是否成功完成一次扫描(宿主就绪)。
-   */
+  /** Inspect newly available sessions; process each settled startup history once. */
   private async scanInterrupted(): Promise<boolean> {
     const config = this.getConfig();
-    if (config.paused) return true; // 全局暂停: 不做任何扫描
-    // 只扫 live agents(host 重启后 agent-loop 会 resume 崩溃会话, 冷会话无需处理)
+    if (config.paused || !config.scanOnBoot) return false;
     const now = Date.now();
     const candidates: {
-      sessionId: SessionId;
+      session: Session;
       events: readonly SessionEvent[];
+      lastEnd: SessionEvent<'turn/end'>;
+      reasonKind: string;
+      failure?: FailureFacts;
       lastActivityAt: number;
       listIndex: number;
     }[] = [];
     for (const agent of this.ctx.agents.list()) {
       const session = agent.session;
-      if (session.header.origin === 'subagent') continue; // 子代理由父代理处理
-      const events = snapshotSessionEvents(session);
-      const lastActivityAt = events.reduce(
-        (latest, event) => Math.max(latest, event.time),
-        Number.isFinite(session.header.createdAt) ? session.header.createdAt : 0,
-      );
-      candidates.push({
-        sessionId: session.id,
-        events,
-        lastActivityAt,
-        listIndex: candidates.length,
-      });
-    }
-    candidates.sort(
-      (left, right) =>
-        right.lastActivityAt - left.lastActivityAt || left.listIndex - right.listIndex,
-    );
-    for (const candidate of candidates.slice(0, config.scanLimit)) {
-      if (this.disposed) return true;
-      const state = this.state(candidate.sessionId);
-      if (state.pendingTimer !== undefined) continue;
-      if (state.consecutive >= config.maxConsecutive) continue;
+      if (session.header.origin === 'subagent' || this.bootScannedSessions.has(session)) continue;
+      const state = this.state(session.id);
+      if (state.pendingTimer !== undefined || state.consecutive >= config.maxConsecutive) continue;
       if (now - state.lastAttemptAt < this.cooldownFor(state)) continue;
-      if (now < (this.pauseUntil.get(candidate.sessionId) ?? 0)) continue; // 会话暂停中
-      const events = candidate.events;
-      // 从尾部找最后一个 turn/end
+      if (now < (this.pauseUntil.get(session.id) ?? 0)) continue;
+      const events = snapshotSessionEvents(session);
+      // A published session may still be waiting for its first history snapshot.
+      if (events.length === 0) continue;
       let lastEnd: SessionEvent<'turn/end'> | undefined;
       for (let i = events.length - 1; i >= 0; i -= 1) {
         const event = events[i];
-        if (event !== undefined && event.type === 'turn/end') {
-          lastEnd = event;
-          break;
-        }
+        if (event?.type === 'turn/end') { lastEnd = event; break; }
       }
-      if (lastEnd === undefined) continue;
-      const reason = lastEnd.data.reason;
-      const reasonKind = readReasonKind(reason);
-      if (reasonKind === undefined || !isNonHumanReason(reasonKind)) continue;
-      if (lastEnd.time < now - config.freshMs) continue; // 太久远, 不翻旧账
-      // 该 turn/end 之后不能有新回合或用户消息(说明已被处理)
-      let superseded = false;
-      for (const event of events) {
-        if (event.seq <= lastEnd.seq) continue;
-        if (event.type === 'turn/start') superseded = true;
-        if (event.type === 'user/message' && event.data.source.kind === 'user') superseded = true;
-        if (superseded) break;
+      const reasonKind = readReasonKind(lastEnd?.data.reason);
+      const superseded = lastEnd !== undefined && events.some((event) =>
+        event.seq > lastEnd!.seq && (event.type === 'turn/start' ||
+          (event.type === 'user/message' && event.data.source.kind === 'user')),
+      );
+      if (lastEnd === undefined || reasonKind === undefined || !isNonHumanReason(reasonKind) ||
+          lastEnd.time < now - config.freshMs || superseded) {
+        this.bootScannedSessions.add(session);
+        continue;
       }
-      if (superseded) continue;
-      // 幂等护栏: 从历史事件里重建上一步工具调用的执行状态
-      this.applyGuardFromEvents(state, events, lastEnd.seq);
-      const scanReason = `scan:turn/end:${reasonKind}`;
-      this.log(`扫描发现中断 ${candidate.sessionId}(turn/end:${reasonKind}), 交给恢复策略处理`);
+      let failure: FailureFacts | undefined;
       if (reasonKind === 'error') {
-        const failure = parseFailureFacts((reason as { error?: unknown }).error);
+        failure = parseFailureFacts((lastEnd.data.reason as { error?: unknown }).error);
         if (failure === undefined) {
-          console.error(`[auto-continue] 忽略畸形扫描 turn/end ${candidate.sessionId}: error details 无法解释`);
+          this.bootScannedSessions.add(session);
+          console.error(`[auto-continue] 忽略畸形扫描 turn/end ${session.id}: error details 无法解释`);
           continue;
         }
+        if (config.classify && !isTransientFailure(failure, config.retryableErrorPatterns)) {
+          this.bootScannedSessions.add(session);
+          this.onTurnFailure(session.id, 'scan:turn/end:error', failure);
+          continue;
+        }
+      }
+      candidates.push({
+        session, events, lastEnd, reasonKind, failure,
+        lastActivityAt: events.reduce((latest, event) => Math.max(latest, event.time), 0),
+        listIndex: candidates.length,
+      });
+    }
+    // Limit recoveries, not healthy/permanent histories that cannot be resumed.
+    candidates.sort((left, right) => right.lastActivityAt - left.lastActivityAt || left.listIndex - right.listIndex);
+    for (const candidate of candidates.slice(0, config.scanLimit)) {
+      if (this.disposed) return true;
+      const { session, events, lastEnd, reasonKind, failure } = candidate;
+      this.bootScannedSessions.add(session);
+      const state = this.state(session.id);
+      this.applyGuardFromEvents(state, events, lastEnd.seq);
+      const scanReason = `scan:turn/end:${reasonKind}`;
+      this.log(`扫描发现中断 ${session.id}(turn/end:${reasonKind}), 交给恢复策略处理`);
+      if (failure !== undefined) {
         state.lastFailure = failure;
         state.lastTurn = lastEnd.data.turn;
         state.lastFailureAt = lastEnd.time;
-        this.onTurnFailure(candidate.sessionId, scanReason, state.lastFailure);
+        this.onTurnFailure(session.id, scanReason, failure);
       } else {
-        this.schedule(candidate.sessionId, scanReason);
+        this.schedule(session.id, scanReason);
       }
     }
-    return true;
+    return false;
   }
 
   /** 从历史事件恢复上一步工具调用状态(扫描路径的幂等护栏)。 */

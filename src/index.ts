@@ -1,8 +1,9 @@
 /**
  * Host half of the auto-continue plugin.
  *
- * - Registers the `auto-continue` settings namespace (the browser half's
- *   settings card edits it; the host engine reads it).
+ * - Configuration is this entry's own Loader config: `apply(ctx, config)`
+ *   injects it into the engine, where `resolveConfig` merges it with the
+ *   schema defaults (the browser half's settings card writes the same values).
  * - Runs the single-instance auto-continue engine: listens to the session
  *   event firehose, sends via `agent.followup`, cancels via `agent.cancel`.
  * - Serves a status bridge the browser half subscribes to: notifications and
@@ -11,10 +12,8 @@
  */
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import type { SettingsNamespace } from '@deepseek-ai/dsh-settings';
 import { AutoContinueRunner } from './host/engine.ts';
 import { resolveConfig, type AutoContinueSettings } from './shared/core.ts';
-// The type-only settings import also pulls in the `ctx.settings` Context augmentation.
 // Type-only: pulls the `ctx.webServer` Context augmentation.
 import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-agent';
@@ -22,7 +21,6 @@ import type {} from '@deepseek-ai/dsh-session';
 
 /** Settings namespace of the auto-continue plugin (lowercase kebab-case). */
 export const AUTO_CONTINUE_NS = 'auto-continue';
-const SETTINGS_NS = AUTO_CONTINUE_NS as SettingsNamespace;
 
 /** Wire schema; blank localized text fields tell resolveConfig() to select the active locale's defaults. */
 export const AutoContinueSchema = z.object({
@@ -86,34 +84,61 @@ export const AutoContinueSchema = z.object({
     .default(''),
 });
 
+/** Loader config is a live reference on DSH 0.1.7, and a plain object on older hosts. */
+export type AutoContinueEntryConfig = AutoContinueSettings | { get(): AutoContinueSettings | undefined };
+
+// Keep the wire schema usable by legacy Settings while exposing the live root
+// to current Loaders. Older Schemastery releases do not have volatile().
+const entrySchema = AutoContinueSchema as typeof AutoContinueSchema & {
+  volatile?: () => z<AutoContinueSettings, AutoContinueEntryConfig>;
+};
+export const Config = entrySchema.volatile?.() ?? AutoContinueSchema;
+
+function entryConfig(config: AutoContinueEntryConfig | undefined): AutoContinueSettings | undefined {
+  return config !== undefined && 'get' in config ? config.get() : config;
+}
+
 /**
- * Plugin body: register the settings namespace, start the single-instance
- * engine, and serve the status bridge.
+ * Plugin body: start the single-instance engine and serve the status bridge.
+ *
+ * Configuration comes from this entry's own Loader config (merged with the
+ * schema defaults by `resolveConfig`); the current harness exposes entry
+ * config through the settings service instead of the legacy `register`/`get`
+ * namespace API this plugin was originally written against.
  * @param ctx - host plugin context.
+ * @param config - this entry's config (may be partial / absent → defaults).
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
+  let legacyConfig: (() => AutoContinueSettings | undefined) | undefined;
+  // Settings is optional: it must never prevent the engine or bridge starting.
+  // Hosts predating Config-derived forms still own a separate settings document.
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.register(SETTINGS_NS, AutoContinueSchema, {
-      applies: 'live',
+    const settings = (settingsCtx as unknown as { settings: {
+      register?: (ns: string, schema: typeof AutoContinueSchema, options: { applies: string }) => unknown;
+      get?: (ns: string) => AutoContinueSettings | undefined;
+    } }).settings;
+    if (typeof settings.register !== 'function' || typeof settings.get !== 'function') return;
+    settings.register(AUTO_CONTINUE_NS, AutoContinueSchema, { applies: 'live' });
+    const read = () => settings.get!(AUTO_CONTINUE_NS);
+    legacyConfig = read;
+    settingsCtx.effect(() => () => {
+      if (legacyConfig === read) legacyConfig = undefined;
     });
   });
-
   // 引擎引用: inject 回调可能重入(依赖组合变化), 顶层 effect 在 fiber 卸载时必跑。
   // dispose 绑定必须挂在 apply 的顶层 ctx 上——挂 inject 派生 ctx 的 effect 在 config HMR
   // 替换行时不会执行, 悬空定时器会撞上 inactive context 炸掉整个进程。
-  let runnerRef: AutoContinueRunner | undefined;
+  let disposeEngine: (() => void) | undefined;
 
   // 单实例引擎: host 进程内监听会话事件, 所有标签页共享同一个引擎。
-  ctx.inject(['settings', 'agents', 'webServer'], (engineCtx) => {
+  ctx.inject(['agents', 'webServer'], (engineCtx) => {
     // 回调重入时先清理旧引擎, 避免定时器与监听器叠加。
-    if (runnerRef !== undefined) runnerRef.dispose();
-    const runner = new AutoContinueRunner(engineCtx, () =>
-      resolveConfig(engineCtx.settings.get(SETTINGS_NS) as AutoContinueSettings | undefined),
-    );
-    runnerRef = runner;
+    disposeEngine?.();
+    const runner = new AutoContinueRunner(engineCtx, () => resolveConfig(legacyConfig?.() ?? entryConfig(config)));
 
     // 状态桥: browser 侧订阅通知与运行时状态(SSE)。
     const sseClients = new Set<(data: string) => void>();
+    const closeClients = new Set<() => void>();
     const pushToAll = (data: string): void => {
       for (const send of sseClients) {
         try {
@@ -139,7 +164,7 @@ export function apply(ctx: Context): void {
       pushToAll(`data: ${statePayload()}\n\n`);
     });
 
-    engineCtx.webServer.register({
+    const stopBridge = engineCtx.webServer.register({
       kind: 'exact',
       path: '/api/auto-continue-bridge',
       handler: (req, res) => {
@@ -153,12 +178,17 @@ export function apply(ctx: Context): void {
           res.write(data);
         };
         sseClients.add(send);
-        req.on('close', () => sseClients.delete(send));
+        const close = () => { res.end(); };
+        closeClients.add(close);
+        req.on('close', () => {
+          sseClients.delete(send);
+          closeClients.delete(close);
+        });
       },
     });
 
     // 通知按钮动作: browser 点击「立即续跑 / 暂停该会话」时 POST 到这里。
-    engineCtx.webServer.register({
+    const stopActions = engineCtx.webServer.register({
       kind: 'exact',
       path: '/api/auto-continue-action',
       handler: (req, res) => {
@@ -185,13 +215,26 @@ export function apply(ctx: Context): void {
         });
       },
     });
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      runner.dispose();
+      stopBridge();
+      stopActions();
+      for (const close of closeClients) close();
+      closeClients.clear();
+      sseClients.clear();
+    };
+    disposeEngine = dispose;
+    engineCtx.effect(() => dispose);
   });
 
   // 顶层生命周期绑定: fiber 卸载时清理引擎(定时器/监听器)。
   // 挂在 apply 的 ctx 上保证 Cordis 一定会调用, 防止 inactive context 崩溃。
   ctx.effect(() => () => {
-    const runner = runnerRef;
-    runnerRef = undefined;
-    if (runner !== undefined) runner.dispose();
+    const dispose = disposeEngine;
+    disposeEngine = undefined;
+    dispose?.();
   });
 }

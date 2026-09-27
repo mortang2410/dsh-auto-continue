@@ -261,6 +261,8 @@ auto-continue:
 
 ## 开发
 
+CI 会使用已发布的 DSH 0.1.7 组件，通过真实 Loader 检查 HTTP 桥与设置的实时读写。先运行一次 `npm ci --prefix tests/fixtures/dsh-0.1.7`，构建后运行 `npm run test:runtime`。
+
 ```bash
 npm run typecheck   # tsc --noEmit
 npm run build       # lib/client.js + lib/index.js + lib/types

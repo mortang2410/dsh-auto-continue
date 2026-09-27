@@ -284,6 +284,7 @@ function makeHost() {
   const ctx = {
     effect: (cb) => registerEffect(topLevelEffects, cb),
     inject(deps, cb) {
+      if (deps.includes('settings')) return () => {};
       engineInject = cb;
       cb(makeEngineContext());
       return () => {};

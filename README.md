@@ -261,6 +261,8 @@ The plugin is browser-only and touches **no files, credentials, or network beyon
 
 ## Development
 
+The CI runtime test uses the published DSH 0.1.7 packages to check the HTTP bridge and live settings through the real Loader. Run `npm ci --prefix tests/fixtures/dsh-0.1.7` once, then `npm run test:runtime` after building.
+
 ```bash
 npm run typecheck   # tsc --noEmit
 npm run build       # lib/client.js + lib/index.js + lib/types

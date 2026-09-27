@@ -46,11 +46,11 @@ export const AutoContinueSchema = z.object({
   cooldownMs: z.natural().default(20000),
   /** Max consecutive auto-continues per session before stopping. */
   maxConsecutive: z.natural().min(1).default(3),
-  /** Scan recently interrupted sessions on page load / reconnect. */
+  /** Recover delayed interrupted sessions during the host startup window. */
   scanOnBoot: z.boolean().default(true),
-  /** Max sessions the scan checks (most recently updated). */
+  /** Max eligible recoveries per scan pass (most recently active first). */
   scanLimit: z.natural().min(1).default(8),
-  /** Scan only considers interruptions inside this window (ms). */
+  /** Interruption freshness and duration of startup polling (ms). */
   freshMs: z.natural().default(15 * 60 * 1000),
   /** Log `[auto-continue]` lines to the browser console. */
   verbose: z.boolean().default(true),

@@ -35,11 +35,11 @@ export declare const AutoContinueSchema: z<Schemastery.ObjectS<{
     cooldownMs: z<number, number>;
     /** Max consecutive auto-continues per session before stopping. */
     maxConsecutive: z<number, number>;
-    /** Scan recently interrupted sessions on page load / reconnect. */
+    /** Recover delayed interrupted sessions during the host startup window. */
     scanOnBoot: z<boolean, boolean>;
-    /** Max sessions the scan checks (most recently updated). */
+    /** Max eligible recoveries per scan pass (most recently active first). */
     scanLimit: z<number, number>;
-    /** Scan only considers interruptions inside this window (ms). */
+    /** Interruption freshness and duration of startup polling (ms). */
     freshMs: z<number, number>;
     /** Log `[auto-continue]` lines to the browser console. */
     verbose: z<boolean, boolean>;
@@ -88,11 +88,11 @@ export declare const AutoContinueSchema: z<Schemastery.ObjectS<{
     cooldownMs: z<number, number>;
     /** Max consecutive auto-continues per session before stopping. */
     maxConsecutive: z<number, number>;
-    /** Scan recently interrupted sessions on page load / reconnect. */
+    /** Recover delayed interrupted sessions during the host startup window. */
     scanOnBoot: z<boolean, boolean>;
-    /** Max sessions the scan checks (most recently updated). */
+    /** Max eligible recoveries per scan pass (most recently active first). */
     scanLimit: z<number, number>;
-    /** Scan only considers interruptions inside this window (ms). */
+    /** Interruption freshness and duration of startup polling (ms). */
     freshMs: z<number, number>;
     /** Log `[auto-continue]` lines to the browser console. */
     verbose: z<boolean, boolean>;
@@ -146,11 +146,11 @@ export declare const Config: z<Schemastery.ObjectS<{
     cooldownMs: z<number, number>;
     /** Max consecutive auto-continues per session before stopping. */
     maxConsecutive: z<number, number>;
-    /** Scan recently interrupted sessions on page load / reconnect. */
+    /** Recover delayed interrupted sessions during the host startup window. */
     scanOnBoot: z<boolean, boolean>;
-    /** Max sessions the scan checks (most recently updated). */
+    /** Max eligible recoveries per scan pass (most recently active first). */
     scanLimit: z<number, number>;
-    /** Scan only considers interruptions inside this window (ms). */
+    /** Interruption freshness and duration of startup polling (ms). */
     freshMs: z<number, number>;
     /** Log `[auto-continue]` lines to the browser console. */
     verbose: z<boolean, boolean>;
@@ -199,11 +199,11 @@ export declare const Config: z<Schemastery.ObjectS<{
     cooldownMs: z<number, number>;
     /** Max consecutive auto-continues per session before stopping. */
     maxConsecutive: z<number, number>;
-    /** Scan recently interrupted sessions on page load / reconnect. */
+    /** Recover delayed interrupted sessions during the host startup window. */
     scanOnBoot: z<boolean, boolean>;
-    /** Max sessions the scan checks (most recently updated). */
+    /** Max eligible recoveries per scan pass (most recently active first). */
     scanLimit: z<number, number>;
-    /** Scan only considers interruptions inside this window (ms). */
+    /** Interruption freshness and duration of startup polling (ms). */
     freshMs: z<number, number>;
     /** Log `[auto-continue]` lines to the browser console. */
     verbose: z<boolean, boolean>;

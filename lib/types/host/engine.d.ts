@@ -73,8 +73,9 @@ export declare class AutoContinueRunner {
      * 然后交给回合状态机。
      */
     private onHostEvent;
-    /** assistant/message 是否带有可见输出: 非空文本或工具调用(推理不算)。 */
-    private hasVisibleOutput;
+    private tracksOutput;
+    /** Treat unknown block kinds conservatively: only reasoning and blank text are silent. */
+    private hasVisibleContent;
     /** 从 assistant/message 事件提取纯文本。 */
     private assistantText;
     private assistantChunkText;

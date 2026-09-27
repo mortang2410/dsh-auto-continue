@@ -34,7 +34,7 @@ export interface AutoContinueSettings {
     continueText?: string;
     /** Text sent when the output token ceiling is reached (same placeholders as `continueText`). */
     continueTextMaxTokens?: string;
-    /** Resume a turn that ended normally with no visible output (reasoning only: no text, no tool call). */
+    /** Resume observed model activity that completes without visible output. */
     resumeSilentTurns?: boolean;
     /** Text sent to resume a silent turn (same placeholders as `continueText`). */
     continueTextSilent?: string;
@@ -295,8 +295,10 @@ export interface SessionState {
     lastTurn: number | undefined;
     /** 我们最近一次自动发送的时间戳; 0 = 没有待确认的恢复。 */
     pendingRecoveryAt: number;
-    /** 当前回合的可见输出: 未见到 turn/start 时为 unknown; 出现非空文本或工具调用后为 visible。 */
-    turnOutput: 'unknown' | 'silent' | 'visible';
+    /** unknown: no observed start; empty: no model activity; silent: activity without visible output. */
+    turnOutput: 'unknown' | 'empty' | 'silent' | 'visible';
+    outputTurn: number | undefined;
+    outputStartSeq: number;
     /** 当前连续短句数(loop guard 信号 1: 空转)。 */
     shortRun: number;
     /** 最后一条短句的时间(时间窗判定用)。 */

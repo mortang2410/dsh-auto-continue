@@ -23,7 +23,7 @@ export declare const AutoContinueSchema: z<Schemastery.ObjectS<{
     continueText: z<string, string>;
     /** Text sent when the output token ceiling is reached (same placeholders as `continueText`). */
     continueTextMaxTokens: z<string, string>;
-    /** Resume a turn that ended normally with no visible output (reasoning only: no text, no tool call). */
+    /** Resume observed model activity that completes without visible output. */
     resumeSilentTurns: z<boolean, boolean>;
     /** Text sent to resume a silent turn (same placeholders as `continueText`). */
     continueTextSilent: z<string, string>;
@@ -80,7 +80,7 @@ export declare const AutoContinueSchema: z<Schemastery.ObjectS<{
     continueText: z<string, string>;
     /** Text sent when the output token ceiling is reached (same placeholders as `continueText`). */
     continueTextMaxTokens: z<string, string>;
-    /** Resume a turn that ended normally with no visible output (reasoning only: no text, no tool call). */
+    /** Resume observed model activity that completes without visible output. */
     resumeSilentTurns: z<boolean, boolean>;
     /** Text sent to resume a silent turn (same placeholders as `continueText`). */
     continueTextSilent: z<string, string>;
@@ -142,7 +142,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     continueText: z<string, string>;
     /** Text sent when the output token ceiling is reached (same placeholders as `continueText`). */
     continueTextMaxTokens: z<string, string>;
-    /** Resume a turn that ended normally with no visible output (reasoning only: no text, no tool call). */
+    /** Resume observed model activity that completes without visible output. */
     resumeSilentTurns: z<boolean, boolean>;
     /** Text sent to resume a silent turn (same placeholders as `continueText`). */
     continueTextSilent: z<string, string>;
@@ -199,7 +199,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     continueText: z<string, string>;
     /** Text sent when the output token ceiling is reached (same placeholders as `continueText`). */
     continueTextMaxTokens: z<string, string>;
-    /** Resume a turn that ended normally with no visible output (reasoning only: no text, no tool call). */
+    /** Resume observed model activity that completes without visible output. */
     resumeSilentTurns: z<boolean, boolean>;
     /** Text sent to resume a silent turn (same placeholders as `continueText`). */
     continueTextSilent: z<string, string>;

@@ -30,7 +30,7 @@ export const AutoContinueSchema = z.object({
   continueText: z.string().default(''),
   /** Text sent when the output token ceiling is reached (same placeholders as `continueText`). */
   continueTextMaxTokens: z.string().default(''),
-  /** Resume a turn that ended normally with no visible output (reasoning only: no text, no tool call). */
+  /** Resume observed model activity that completes without visible output. */
   resumeSilentTurns: z.boolean().default(true),
   /** Text sent to resume a silent turn (same placeholders as `continueText`). */
   continueTextSilent: z.string().default(''),

@@ -2668,8 +2668,10 @@ const SILENT_ZH = '继续。你上一轮只输出了内部推理, 既没有回�
   const english = enHost.makeAgent('silent-en');
   await sleep(50);
   host.emit(custom.session, turnStart(1));
+  host.emit(custom.session, reasoningMsg(5));
   host.emit(custom.session, turnEnd(1, { kind: 'completed' }));
   enHost.emit(english.session, turnStart(1));
+  enHost.emit(english.session, reasoningMsg(5));
   enHost.emit(english.session, turnEnd(1, { kind: 'completed' }));
   await sleep(600);
   check('使用自定义无输出文本', custom.followups[0]?.content?.[0]?.text === 'Keep going, answer visibly');

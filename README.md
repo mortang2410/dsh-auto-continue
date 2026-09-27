@@ -161,7 +161,9 @@ Everything is configurable from the GUI — no file or console edits needed. Ope
 
 The settings card groups controls by handoff, safety, recovery, loop breaking, and live status. Its header also keeps the open-source repository and a **Star on GitHub** shortcut within reach.
 
-**Or skip the GUI and edit the config file directly** — the engine reads the plugin's section from `~/.dsh/settings.yaml` (one shared file for every plugin's sections), so this works in any install, patched or not. The file is watched and re-read automatically, so changes apply live; restart `dsh web` if a page that was already open doesn't pick them up. Fields you leave out fall back to the defaults in the table below.
+DSH 0.1.7 stores these values in the `auto-continue` entry's config in the active profile patch. The GUI applies edits live without restarting the engine. Older hosts use the `auto-continue` section in `~/.dsh/settings.yaml`; the YAML example below shows that legacy format. Omitted fields use the defaults below.
+
+Startup recovery polls every three seconds for sessions that load late, up to `freshMs` after the engine starts. Each settled session history is inspected once. `scanLimit` limits eligible recoveries per pass, so healthy or permanent-error sessions cannot crowd out interrupted ones. Pausing suspends recovery within the same window; unloading cancels the poller.
 
 The browser mirrors DSH's active language into the internal `locale` field. Leave the five localized text fields empty or omit them to follow that language automatically; any non-empty value is treated as your own template and is never rewritten when the language changes:
 
@@ -204,7 +206,7 @@ auto-continue:
 - Boolean fields are **tri-state**: *Inherit* (use the default) / *On* / *Off*
 - Invalid drafts (non-numbers, values below the minimum) block the save with a hint
 - In a read-only deployment the card shows the stored values but disables every control
-- Changes apply immediately after Save and persist in `~/.dsh/settings.yaml` (uninstalling the plugin leaves the section behind — harmless, delete it by hand if you like)
+- Changes apply immediately after Save and persist in the active profile config (or `~/.dsh/settings.yaml` on older hosts)
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -224,9 +226,9 @@ auto-continue:
 | Grace period (ms) | `3000` | Wait after an interruption; cancelled if the host recovers on its own |
 | Cooldown (ms) | `20000` | Min interval between auto-continues per session (failed attempts count too) |
 | Max consecutive | `3` | Max consecutive auto-continues; stops until a user intervenes or a turn completes |
-| Scan on load / reconnect | `on` | Scan recently interrupted sessions on load / reconnect |
-| Scan limit | `8` | Max sessions scanned (running / subagent sessions excluded) |
-| Scan window (ms) | `900000` | Scan only considers interruptions inside this window |
+| Scan on host startup | `on` | Recover interrupted sessions that become available during the startup window |
+| Scan limit | `8` | Maximum eligible recoveries per pass, most recently active first |
+| Scan window (ms) | `900000` | Maximum interruption age and duration of startup polling |
 | Verbose logs | `on` | `[auto-continue]` console logs |
 | Classify errors | `on` | Auto-resume transient failures only; auth / balance / model errors are skipped and notified |
 | Custom retryable errors | empty | One case-insensitive literal per line; matching the error code, HTTP status, or message explicitly overrides the built-in classifier |

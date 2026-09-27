@@ -41,6 +41,9 @@ export declare class AutoContinueRunner {
     private readonly disposeSessionEvents;
     private readonly disposeInboxEvents;
     private disposed;
+    private readonly bootScannedSessions;
+    private bootScanTimer;
+    private wakeBootScan;
     /**
      * @param ctx - host plugin context (agents registry, session events).
      * @param getConfig - read the current resolved configuration (entry config).
@@ -116,12 +119,7 @@ export declare class AutoContinueRunner {
     /** 上一步工具调用的护栏状态(实时路径, 由 mux 帧维护)。 */
     private currentGuard;
     private bootScanLoop;
-    /** 反复尝试扫描, 直到成功(宿主就绪)或达到次数上限。 */
-    private scanLoop;
-    /**
-     * 扫描最近中断过的会话: 最后回合以非人为原因结束, 且其后没有新回合或用户消息。
-     * @returns 是否成功完成一次扫描(宿主就绪)。
-     */
+    /** Inspect newly available sessions; process each settled startup history once. */
     private scanInterrupted;
     /** 从历史事件恢复上一步工具调用状态(扫描路径的幂等护栏)。 */
     private applyGuardFromEvents;

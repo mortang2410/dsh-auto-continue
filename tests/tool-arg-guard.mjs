@@ -135,21 +135,74 @@ try {
     assert.equal(cancels.length, 1, 'an empty live delta must not reset the run');
   }
 
-  // The real ab45 trace: one 602,620-character whitespace run, replayed as run lengths.
+  // The real ab45 trace, per delta: the counter crosses 16,384 at delta 6,152.
   {
     const { h, agent, cancels } = started();
     const fixture = JSON.parse(readFileSync(new URL('./fixtures/ab45-whitespace-runs.json', import.meta.url), 'utf8'));
-    const runs = fixture.whitespaceRuns;
-    let crossedAt = -1;
-    for (let i = 0; i < runs.length; i += 1) {
-      h.emit(agent, argChunk(' '.repeat(runs[i])));
-      if (cancels.length > 0 && crossedAt < 0) crossedAt = i;
+    let firedAt = -1;
+    for (let i = 0; i < fixture.firstDeltas.length; i += 1) {
+      const length = fixture.firstDeltas[i];
+      h.emit(agent, argChunk(length > 0 ? ' '.repeat(length) : length === 0 ? '' : 'x'));
+      if (cancels.length > 0 && firedAt < 0) firedAt = i;
       if (cancels.length > 0) break;
-      if (i < runs.length - 1) h.emit(agent, argChunk('{"a":1}'));
     }
     await flush();
     assert.equal(cancels.length, 1, 'the real ab45 trace must trip the guard');
-    assert.equal(crossedAt, runs.findIndex((run) => run >= 16_384), 'the trip happens at the first run past the threshold');
+    assert.equal(firedAt, fixture.tripIndex, 'the trip happens at the recorded delta');
+  }
+
+  // A step/start between two refused trips resets the log gates: each step logs one trip and
+  // one refusal line (kills a missing step/start flag reset).
+  {
+    const logs = [];
+    const original = console.info;
+    console.info = (line) => logs.push(String(line));
+    try {
+      const { h, agent, cancels } = started({ cooldownMs: 20_000, verbose: true });
+      h.emit(agent, argChunk(' '.repeat(16_400)));
+      await flush();
+      assert.equal(cancels.length, 1, 'the first runaway cancels');
+      h.emit(agent, turnStart(2));
+      logs.length = 0;
+      h.emit(agent, argChunk(' '.repeat(16_400))); // refused trip 1
+      await flush();
+      h.emit(agent, { type: 'step/start', seq: seq++, time: Date.now(), data: { turn: 2, step: 2 } });
+      h.emit(agent, argChunk(' '.repeat(16_400))); // refused trip 2, new step
+      await flush();
+      assert.equal(cancels.length, 1, 'both trips stay inside the cooldown');
+      assert.equal(logs.filter((line) => line.includes('检测到工具参数复读')).length, 2, 'each step logs its trip');
+      assert.equal(logs.filter((line) => line.includes('跳过循环打断')).length, 2, 'each step logs its refusal');
+    } finally {
+      console.info = original;
+    }
+  }
+
+  // A live start frame between two refused trips resets the log gates (kills a missing
+  // live-start flag reset).
+  {
+    const logs = [];
+    const original = console.info;
+    console.info = (line) => logs.push(String(line));
+    try {
+      const { h, agent, cancels } = started({ cooldownMs: 20_000, verbose: true });
+      h.emitStream(agent, liveStart());
+      h.emitStream(agent, liveChunk(' '.repeat(16_400)));
+      await flush();
+      assert.equal(cancels.length, 1, 'the first live runaway cancels');
+      h.emit(agent, turnStart(2));
+      logs.length = 0;
+      h.emitStream(agent, liveStart());
+      h.emitStream(agent, liveChunk(' '.repeat(16_400))); // refused trip 1
+      await flush();
+      h.emitStream(agent, liveStart());
+      h.emitStream(agent, liveChunk(' '.repeat(16_400))); // refused trip 2, new attempt
+      await flush();
+      assert.equal(cancels.length, 1, 'both trips stay inside the cooldown');
+      assert.equal(logs.filter((line) => line.includes('检测到工具参数复读')).length, 2, 'each attempt logs its trip');
+      assert.equal(logs.filter((line) => line.includes('跳过循环打断')).length, 2, 'each attempt logs its refusal');
+    } finally {
+      console.info = original;
+    }
   }
 
   // During the cooldown the trip and the refusal are each logged once per step, and the cancel

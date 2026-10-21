@@ -35,6 +35,7 @@ import {
   sleep,
   todayKey,
   trackPendingEcho,
+  TOOL_ARG_GUARD,
   type AutoContinueConfig,
   type AutoContinueLocale,
   type DayStats,
@@ -883,6 +884,7 @@ export class AutoContinueRunner {
       state.stepOutput = 'none';
       // Per-step reasoning density resets at each model step (vrpe).
       state.reasonDensity.reset();
+      state.toolArgWhitespaceRun = 0;
       const repeat = state.tools.confirmRepeatAtStep(event.seq);
       if (repeat !== undefined) this.checkLoop(sessionId, state, repeat);
     } else if (event.type === 'assistant/chunk') {
@@ -1070,6 +1072,7 @@ export class AutoContinueRunner {
       // Mirrors the step/start reset on the session-event path.
       state.stepOutput = 'none';
       state.reasonDensity.reset();
+      state.toolArgWhitespaceRun = 0;
     } else if (frame.type === 'chunk') {
       const chunk = frame.chunk;
       if (this.chunkIsVisible(chunk)) state.stepOutput = 'visible';
@@ -1084,6 +1087,20 @@ export class AutoContinueRunner {
     modelChunk: AssistantChunk,
   ): void {
     if (!this.getConfig().loopGuard || !state.running || state.loopFired) return;
+    // kata ab45: a degenerate function-call argument stream emits an unending run of whitespace and
+    // never closes its JSON. Whitespace-only deltas accumulate; any real content resets the run.
+    if (modelChunk.type === 'tool-call-delta') {
+      if (/^\s+$/u.test(modelChunk.argumentsDelta)) {
+        state.toolArgWhitespaceRun += modelChunk.argumentsDelta.length;
+        if (state.toolArgWhitespaceRun >= TOOL_ARG_GUARD.whitespaceRunChars) {
+          this.log(`检测到工具参数复读 ${sessionId}: 连续 ${state.toolArgWhitespaceRun} 字符空白`);
+          this.interruptLoop(sessionId, state);
+          return;
+        }
+      } else {
+        state.toolArgWhitespaceRun = 0;
+      }
+    }
     // Reasoning-only step whose reasoning is mostly one sentence repeated, or whose lines are
     // mostly one short repeated line (vrpe, both arms of REASON_DENSITY). The gate is unchanged:
     // only a reasoning delta, and only while the step has produced no visible output.
@@ -1217,6 +1234,7 @@ export class AutoContinueRunner {
         state.turnOutput = 'empty';
         state.stepOutput = 'none';
         state.reasonDensity.reset();
+        state.toolArgWhitespaceRun = 0;
         state.reasoningOnlyUnits = 0;
         state.outputTurn = event.data.turn;
         state.outputStartSeq = event.seq;

@@ -878,6 +878,18 @@ export const REASON_DENSITY = {
   maxLineChars: 65_536,
 } as const;
 
+/**
+ * Tool-argument runaway (kata ab45): a degenerate function-call argument stream emits an unending
+ * run of whitespace and never closes its JSON. The incident wrote 604,399 whitespace characters
+ * in 112,064 argument deltas over 20 minutes, with only 8,914 non-whitespace characters, so a run
+ * of pure-whitespace deltas is the signal. Legitimate arguments, even pretty-printed code, put
+ * non-whitespace content between whitespace, which resets the run. 16 KiB of consecutive
+ * whitespace is about 20 seconds at the incident's ~90 deltas per second.
+ */
+export const TOOL_ARG_GUARD = {
+  whitespaceRunChars: 16_384,
+} as const;
+
 /** Streaming repetition density over the reasoning channel of one step. */
 export class ReasoningDensity {
   private chars = 0;
@@ -1048,6 +1060,8 @@ export interface SessionState {
   reasoningOnlyUnits: number;
   /** Reasoning-channel repetition density of the current step (vrpe). */
   reasonDensity: ReasoningDensity;
+  /** kata ab45: consecutive whitespace-only tool-argument characters in this step. */
+  toolArgWhitespaceRun: number;
   /** 当前连续短句数(loop guard 信号 1: 空转)。 */
   shortRun: number;
   /** 最后一条短句的时间(时间窗判定用)。 */
@@ -1096,6 +1110,7 @@ export const freshState = (): SessionState => ({
   stepOutput: 'none',
   reasoningOnlyUnits: 0,
   reasonDensity: new ReasoningDensity(),
+  toolArgWhitespaceRun: 0,
   shortRun: 0,
   lastShortAt: 0,
   lastAssistantText: '',

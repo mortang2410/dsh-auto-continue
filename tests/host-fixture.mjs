@@ -34,6 +34,8 @@ export function makeHost(overrides = {}, extras = {}) {
     listReads: () => listReads,
     start() { apply(ctx, config); },
     emit(agent, event) { for (const callback of handlers.get('session/event') ?? []) callback(agent.session, event); },
+    /** Mirrors the host's agent/assistant-stream emit (dsh-agent-loop lib/index.js): one { agent, frame } payload. */
+    emitStream(agent, frame) { for (const callback of handlers.get('agent/assistant-stream') ?? []) callback({ agent, frame }); },
     /** Mirrors the host's agent/disposed emit (dsh-agent/lib/index.js:547-560): one { agent } payload per listener. */
     emitDisposed(agent) { for (const callback of handlers.get('agent/disposed') ?? []) callback({ agent }); },
     /** Mirrors the host's agent/created emit (dsh-agent/lib/index.js:announce): one { agent } payload per listener. */

@@ -880,11 +880,16 @@ export const REASON_DENSITY = {
 
 /**
  * Tool-argument runaway (kata ab45): a degenerate function-call argument stream emits an unending
- * run of whitespace and never closes its JSON. The incident wrote 604,399 whitespace characters
- * in 112,064 argument deltas over 20 minutes, with only 8,914 non-whitespace characters, so a run
- * of pure-whitespace deltas is the signal. Legitimate arguments, even pretty-printed code, put
- * non-whitespace content between whitespace, which resets the run. 16 KiB of consecutive
- * whitespace is about 20 seconds at the incident's ~90 deltas per second.
+ * run of whitespace and never closes its JSON. In the incident (bifrost logs.db row 171891) the
+ * argument stream was 112,064 deltas: 109,513 whitespace-only, 0 empty, and the whitespace formed
+ * one run of 602,620 characters. A run of pure-whitespace deltas is the signal; a non-whitespace
+ * delta resets it. 16 KiB of consecutive whitespace is about 33 seconds at the incident's 494
+ * whitespace characters per second.
+ *
+ * Tradeoff: a legitimate argument that carries a whitespace-only string value (a ~16 KiB run of
+ * spaces or tabs inside JSON) also trips. Accepted, because such an argument is indistinguishable
+ * from the runaway in the delta stream. The run resets at each step and each model attempt (a
+ * retried attempt regenerates the argument stream); within one attempt the run persists.
  */
 export const TOOL_ARG_GUARD = {
   whitespaceRunChars: 16_384,
@@ -1062,6 +1067,9 @@ export interface SessionState {
   reasonDensity: ReasoningDensity;
   /** kata ab45: consecutive whitespace-only tool-argument characters in this step. */
   toolArgWhitespaceRun: number;
+  /** kata ab45: the trip and the cooldown refusal are each logged once per step. */
+  toolArgTripLogged: boolean;
+  toolArgCooldownLogged: boolean;
   /** 当前连续短句数(loop guard 信号 1: 空转)。 */
   shortRun: number;
   /** 最后一条短句的时间(时间窗判定用)。 */
@@ -1111,6 +1119,8 @@ export const freshState = (): SessionState => ({
   reasoningOnlyUnits: 0,
   reasonDensity: new ReasoningDensity(),
   toolArgWhitespaceRun: 0,
+  toolArgTripLogged: false,
+  toolArgCooldownLogged: false,
   shortRun: 0,
   lastShortAt: 0,
   lastAssistantText: '',

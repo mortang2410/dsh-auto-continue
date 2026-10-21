@@ -1,0 +1,12 @@
+{
+ "source": "bifrost logs.db row 171891, response.function_call_arguments.delta sequence",
+ "deltas": 112064,
+ "whitespaceDeltas": 109513,
+ "emptyDeltas": 0,
+ "totalWhitespaceChars": 602621,
+ "note": "One entry per maximal group of consecutive whitespace-only deltas; a non-whitespace delta separated the groups.",
+ "whitespaceRuns": [
+  1,
+  602620
+ ]
+}

@@ -885,6 +885,8 @@ export class AutoContinueRunner {
       // Per-step reasoning density resets at each model step (vrpe).
       state.reasonDensity.reset();
       state.toolArgWhitespaceRun = 0;
+      state.toolArgTripLogged = false;
+      state.toolArgCooldownLogged = false;
       const repeat = state.tools.confirmRepeatAtStep(event.seq);
       if (repeat !== undefined) this.checkLoop(sessionId, state, repeat);
     } else if (event.type === 'assistant/chunk') {
@@ -1062,7 +1064,8 @@ export class AutoContinueRunner {
   /**
    * Live channel (liveStreamGuard, vrpe X-SUB): one agent/assistant-stream frame. The session id is
    * payload.agent.session.id. Turn and step come only on `start` frames. A frame without a session
-   * id is ignored. `start` resets the density count (a retried attempt starts a new count); chunks do not.
+   * id is ignored. `start` resets the density count and the whitespace run (a retried attempt
+   * regenerates the argument stream); chunks do not.
    */
   private onLiveStreamFrame(sessionId: SessionId | undefined, frame: AssistantStreamFrame | undefined): void {
     if (typeof sessionId !== 'string' || frame === undefined) return;
@@ -1073,6 +1076,8 @@ export class AutoContinueRunner {
       state.stepOutput = 'none';
       state.reasonDensity.reset();
       state.toolArgWhitespaceRun = 0;
+      state.toolArgTripLogged = false;
+      state.toolArgCooldownLogged = false;
     } else if (frame.type === 'chunk') {
       const chunk = frame.chunk;
       if (this.chunkIsVisible(chunk)) state.stepOutput = 'visible';
@@ -1090,15 +1095,30 @@ export class AutoContinueRunner {
     // kata ab45: a degenerate function-call argument stream emits an unending run of whitespace and
     // never closes its JSON. Whitespace-only deltas accumulate; any real content resets the run.
     if (modelChunk.type === 'tool-call-delta') {
-      if (/^\s+$/u.test(modelChunk.argumentsDelta)) {
-        state.toolArgWhitespaceRun += modelChunk.argumentsDelta.length;
-        if (state.toolArgWhitespaceRun >= TOOL_ARG_GUARD.whitespaceRunChars) {
-          this.log(`检测到工具参数复读 ${sessionId}: 连续 ${state.toolArgWhitespaceRun} 字符空白`);
-          this.interruptLoop(sessionId, state);
-          return;
+      const delta = modelChunk.argumentsDelta;
+      // An empty delta carries no characters: it neither extends nor breaks the run.
+      if (delta !== '') {
+        if (/^\s+$/u.test(delta)) {
+          state.toolArgWhitespaceRun += delta.length;
+          if (state.toolArgWhitespaceRun >= TOOL_ARG_GUARD.whitespaceRunChars) {
+            if (!state.toolArgTripLogged) {
+              state.toolArgTripLogged = true;
+              this.log(`检测到工具参数复读 ${sessionId}: 连续 ${state.toolArgWhitespaceRun} 字符空白`);
+            }
+            // Pre-check the cooldown so a refused trip logs at most one skip line per step.
+            if (Date.now() - state.lastAttemptAt < this.cooldownFor(state)) {
+              if (!state.toolArgCooldownLogged) {
+                state.toolArgCooldownLogged = true;
+                this.log(`跳过循环打断 ${sessionId}: 处于冷却期`);
+              }
+              return;
+            }
+            this.interruptLoop(sessionId, state);
+            return;
+          }
+        } else {
+          state.toolArgWhitespaceRun = 0;
         }
-      } else {
-        state.toolArgWhitespaceRun = 0;
       }
     }
     // Reasoning-only step whose reasoning is mostly one sentence repeated, or whose lines are
@@ -1235,6 +1255,8 @@ export class AutoContinueRunner {
         state.stepOutput = 'none';
         state.reasonDensity.reset();
         state.toolArgWhitespaceRun = 0;
+        state.toolArgTripLogged = false;
+        state.toolArgCooldownLogged = false;
         state.reasoningOnlyUnits = 0;
         state.outputTurn = event.data.turn;
         state.outputStartSeq = event.seq;

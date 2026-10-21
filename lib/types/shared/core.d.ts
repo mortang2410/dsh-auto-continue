@@ -16,7 +16,7 @@ export declare const LOCALIZED_TEXT_DEFAULTS: {
         readonly continueTextLoop: "继续";
         readonly guardPendingText: "(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)";
         readonly guardDoneText: "(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)";
-        readonly loopText: "(检测到你可能陷入循环, 请停止重复刚才的动作, 换一种方式继续)";
+        readonly loopText: "你陷入循环了. 立刻做点什么, 任何事都行, 马上打破这个循环";
     };
     readonly en: {
         readonly continueText: "Continue";
@@ -25,7 +25,7 @@ export declare const LOCALIZED_TEXT_DEFAULTS: {
         readonly continueTextLoop: "Continue";
         readonly guardPendingText: "(The previous tool \"{tool}\" may not have completed. Check its state before continuing and do not run it again.)";
         readonly guardDoneText: "(The previous tool \"{tool}\" completed successfully. Result: {result}; do not run it again. Continue from there.)";
-        readonly loopText: "(You may be stuck in a loop. Stop repeating the last action and continue with a different approach.)";
+        readonly loopText: "You are deadass in a loop. DO something, anything right now to break the loop";
     };
 };
 /** The `auto-continue` settings section (all fields optional on the wire; the host schema carries defaults). */
@@ -323,6 +323,13 @@ export interface SessionState {
     streamRepeatRun: number;
     /** 本回合已触发过 loop guard(防重复打断)。 */
     loopFired: boolean;
+    /** 本回合检测到推理复读(与是否真的打断无关, 冷却期内被拒绝的检测也计入); 回合结束时读取并清零。 */
+    spiralTripped: boolean;
+    /**
+     * 当前复读事件已实际送出强制续跑(防复读的上限, 由 fire() 在投递成功后置位, 被拒绝或被取消的调度不占用);
+     * 可见回合完成或用户消息时清零, 回合开始不清零。
+     */
+    spiralEscalated: boolean;
     /** loop 重启的延迟定时器(冷却结束后再 schedule)。 */
     loopRetryTimer: ReturnType<typeof setTimeout> | undefined;
     /** 冷却期恢复的延迟定时器(等到冷却结束再 schedule, 而不是丢弃这次恢复)。 */

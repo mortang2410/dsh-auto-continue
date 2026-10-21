@@ -19,7 +19,7 @@ export const LOCALIZED_TEXT_DEFAULTS = {
     continueTextLoop: '继续',
     guardPendingText: '(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)',
     guardDoneText: '(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)',
-    loopText: '(检测到你可能陷入循环, 请停止重复刚才的动作, 换一种方式继续)',
+    loopText: '你陷入循环了. 立刻做点什么, 任何事都行, 马上打破这个循环',
   },
   en: {
     continueText: 'Continue',
@@ -32,7 +32,7 @@ export const LOCALIZED_TEXT_DEFAULTS = {
     guardDoneText:
       '(The previous tool "{tool}" completed successfully. Result: {result}; do not run it again. Continue from there.)',
     loopText:
-      '(You may be stuck in a loop. Stop repeating the last action and continue with a different approach.)',
+      'You are deadass in a loop. DO something, anything right now to break the loop',
   },
 } as const satisfies Record<AutoContinueLocale, Record<string, string>>;
 
@@ -88,6 +88,8 @@ export interface AutoContinueSettings {
   showComposerToggle?: boolean;
   /** Loop guard: detect a running turn spinning in place (short talk without tools, or the same tool repeating) and restart it. */
   loopGuard?: boolean;
+  /** Live channel guard: also read reasoning spirals from live assistant-stream chunk frames (vrpe). Off by default. */
+  liveStreamGuard?: boolean;
   /** A model message shorter than this many chars counts as a "short sentence" (loop signal). */
   loopShortChars?: number;
   /** Consecutive short sentences within this window (ms) with no tool call in between trip the loop guard. */
@@ -128,6 +130,7 @@ export const DEFAULT_CONFIG: AutoContinueConfig = {
   paused: false,
   showComposerToggle: true,
   loopGuard: true,
+  liveStreamGuard: false,
   loopShortChars: 40,
   loopWindowMs: 30000,
   loopShortCount: 12,
@@ -201,6 +204,7 @@ export function resolveConfig(section: AutoContinueSettings | undefined): AutoCo
     paused: booleanOr(value.paused, DEFAULT_CONFIG.paused),
     showComposerToggle: booleanOr(value.showComposerToggle, DEFAULT_CONFIG.showComposerToggle),
     loopGuard: booleanOr(value.loopGuard, DEFAULT_CONFIG.loopGuard),
+    liveStreamGuard: booleanOr(value.liveStreamGuard, DEFAULT_CONFIG.liveStreamGuard),
     loopShortChars: Math.max(1, numberOr(value.loopShortChars, DEFAULT_CONFIG.loopShortChars)),
     loopWindowMs: Math.max(1000, numberOr(value.loopWindowMs, DEFAULT_CONFIG.loopWindowMs)),
     loopShortCount: Math.max(2, numberOr(value.loopShortCount, DEFAULT_CONFIG.loopShortCount)),
@@ -820,6 +824,194 @@ export function emptyDayStats(): DayStats {
   return { date: todayKey(), sent: 0, skipped: 0, recovered: 0, failed: 0, gaveUp: 0, looped: 0, byCode: {} };
 }
 
+/**
+ * Reasoning-spiral thresholds (kata vrpe). A reasoning-only step trips once it has `minChars`
+ * reasoning characters and either arm of the spiral test fires:
+ *
+ *   sentence arm: `minSentences` counted sentences with a unique-sentence ratio at most
+ *                 `maxUniqueRatio` (the original rule, unchanged);
+ *   line arm:     a distinct-line ratio at most `maxLineRatio` and a most-common-line count of
+ *                 at least `minLineRepeats`, over the non-blank lines of the step.
+ *
+ * The line arm catches what the sentence arm cannot: a spiral whose repeated lines are short, so
+ * a splitter that discards segments of `minSentenceChars` characters or fewer never sees the
+ * repetition (measured on the tuning corpus: 22 of the 25 labelled spiral steps). The sentence
+ * arm stays because the reverse shape exists: one newline-free run of tens of thousands of
+ * characters is only a handful of distinct lines, so the line arm cannot see it while its
+ * sentences repeat (measured: session-0cb0f4f2-7286-4542-b740-2a7467f47eb3 step 68).
+ *
+ * Why the line arm looks at the whole step and not a sliding window. The corpus candidate was a
+ * checkpointed series over the gated text at p = 8000, 8500, ..., and those are the columns the
+ * frozen table prices. The shipped rule instead evaluates the step's own reasoning, because the
+ * guard must act mid-stream: checkpoints are fixed offsets (up to 499 characters stale) and the
+ * counts and their thresholds would have to change meaning as a window slides, while the
+ * whole-step form fires as soon as the step's reasoning is degenerate.
+ *
+ * One known divergence from the frozen columns, in the shipped rule's favor. The table's
+ * `line_full_*` columns include the reasoning text's trailing fragment, the part after the last
+ * newline, while this code counts only lines that a newline has ended: mid-stream that fragment is
+ * still being extended, and counting it as a line would let it be counted twice once it is
+ * terminated. Excluding it lowers the distinct-over-total ratio, so the shipped rule is slightly
+ * MORE sensitive than the columns at that boundary and can trip where the table would not. The
+ * review measured 121 such one-way flips and none in the other direction, so the corpus trip counts
+ * are a lower bound on the shipped rule's recall, and the zero false positives hold under the
+ * stricter reading too, because the false-positive population is caught by the repeat count.
+ */
+export const REASON_DENSITY = {
+  minChars: 8_000,
+  minSentences: 150,
+  maxUniqueRatio: 0.35,
+  minSentenceChars: 15,
+  maxSentenceChars: 1_000,
+  /** Line arm: distinct non-blank lines divided by non-blank lines must not exceed this. */
+  maxLineRatio: 0.30,
+  /** Line arm: the most common non-blank line must occur at least this many times. */
+  minLineRepeats: 300,
+  /** Line arm: the distinct-line ratio is only defined from this many non-blank lines (replay floor). */
+  minRatioLines: 20,
+  /**
+   * Line arm: the longest unterminated tail kept while waiting for the newline that ends a line.
+   * The tail is dropped above this, so a step that never emits a newline cannot retain its whole
+   * reasoning text. Set above the corpus maximum non-blank line (35,586 characters, session
+   * 0cb0f4f2 step 68) so no line that any measured step counts is lost; the margin is 29,950.
+   */
+  maxLineChars: 65_536,
+} as const;
+
+/** Streaming repetition density over the reasoning channel of one step. */
+export class ReasoningDensity {
+  private chars = 0;
+  private sentences = 0;
+  private buffer = '';
+  private readonly counts = new Map<string, number>();
+  /**
+   * Line arm state: the reasoning text of the step so far. Lines can still be extended by a later
+   * delta, so a line is only counted once the newline that ends it has arrived. Only the counters
+   * and this tail are kept; the text is dropped on reset.
+   */
+  private lineTail = '';
+  private lines = 0;
+  private readonly lineCounts = new Map<string, number>();
+  private lineTop = 0;
+  /** Latched on the first trip of the step (vrpe X-M2): later deltas return true without counting. */
+  private latched = false;
+  /** The trip log is written once per step (vrpe X-M2). */
+  tripLogged = false;
+  /** The cooldown refusal log is written once per step (vrpe X-M2). */
+  refusalLogged = false;
+
+  reset(): void {
+    this.chars = 0;
+    this.sentences = 0;
+    this.buffer = '';
+    this.counts.clear();
+    this.lineTail = '';
+    this.lines = 0;
+    this.lineCounts.clear();
+    this.lineTop = 0;
+    this.latched = false;
+    this.tripLogged = false;
+    this.refusalLogged = false;
+  }
+
+  /** Feed one reasoning delta; true once the step meets the spiral thresholds, and it stays true after. */
+  feed(text: string): boolean {
+    if (this.latched) return true;
+    this.chars += text.length;
+    // Full-width 。！？ end Chinese sentences, which have no following space (vrpe X-S1).
+    const parts = `${this.buffer}${text}`.split(/(?<=[.?!])\s+|(?<=[。！？])|\n+/u);
+    this.buffer = parts.pop() ?? '';
+    // A run-on with no sentence boundary is not a sentence; drop it instead of growing the buffer.
+    if (this.buffer.length > REASON_DENSITY.maxSentenceChars) this.buffer = '';
+    for (const part of parts) {
+      const sentence = part.trim();
+      if (sentence.length <= REASON_DENSITY.minSentenceChars) continue;
+      this.sentences += 1;
+      this.counts.set(sentence, (this.counts.get(sentence) ?? 0) + 1);
+    }
+    this.feedLines(text);
+    if (this.tripped()) this.latched = true;
+    return this.latched;
+  }
+
+  /**
+   * Count every line completed by this delta. Only `\n` ends a line; a `\r` before it is part of
+   * the line and is removed by trim, so CRLF reasoning counts as the replay's LF form. A line
+   * that is empty or whitespace only is not counted, which mirrors the replay's non-blank rule.
+   *
+   * The tail is capped for the same reason the sentence buffer is: a step that never emits a
+   * newline would otherwise retain its whole reasoning text here. Measured on the uncapped version,
+   * retained state was 9.10 MB for a 10,000,000 character step, against 0.06 MB with the cap.
+   *
+   * The invariant is `lineTail.length <= maxLineChars`, not "the tail is empty". This method
+   * appends before it tests, so the tail grows to the cap, drops to empty, and regrows: a run of
+   * deltas with no newline ends with a tail of whatever the last append left, which is at most the
+   * cap. A dropped tail is not counted, so no candidate line is invented.
+   *
+   * Two consequences worth knowing. A completed line is always counted, however long, because it
+   * sits before the last newline when the cap is applied. An unterminated line longer than the cap
+   * is dropped, and whether that loses a line depends on how the stream was chunked: one delta that
+   * contains the newline keeps a line of any length, while the same line streamed in pieces is
+   * lost once the tail passes the cap. Only lines longer than `maxLineChars` are affected, which is
+   * 1.8 times the longest line in the corpus, and both effects move the ratio toward tripping while
+   * leaving the repeat count untouched, so the error is on the safe side.
+   */
+  private feedLines(text: string): void {
+    const joined = this.lineTail + text;
+    const last = joined.lastIndexOf('\n');
+    if (last < 0) {
+      this.lineTail = joined.length > REASON_DENSITY.maxLineChars ? '' : joined;
+      return;
+    }
+    for (const piece of joined.slice(0, last).split('\n')) this.countLine(piece);
+    const tail = joined.slice(last + 1);
+    this.lineTail = tail.length > REASON_DENSITY.maxLineChars ? '' : tail;
+  }
+
+  private countLine(piece: string): void {
+    const line = piece.trim();
+    if (line === '') return;
+    this.lines += 1;
+    const count = (this.lineCounts.get(line) ?? 0) + 1;
+    this.lineCounts.set(line, count);
+    if (count > this.lineTop) this.lineTop = count;
+  }
+
+  /**
+   * Sentence arm: enough counted sentences and few enough distinct sentences. Unchanged.
+   */
+  private sentenceTripped(): boolean {
+    return this.sentences >= REASON_DENSITY.minSentences &&
+      this.counts.size <= REASON_DENSITY.maxUniqueRatio * this.sentences;
+  }
+
+  /**
+   * Line arm: enough non-blank lines, few enough distinct non-blank lines, and one line repeated
+   * often enough. The comparisons are the replay's: `distinct <= maxLineRatio * lines` with the
+   * distinct count as an integer, and `top >= minLineRepeats`.
+   *
+   * `minRatioLines` is the replay's `nb >= 20` floor, below which it does not define the ratio at
+   * all (measure_v4/spiral_replay_v4.py, the `nb_p >= LN_MIN_NB` guard). The floor cannot change a
+   * verdict: `top >= minLineRepeats` already forces at least 300 non-blank lines, so the floor is
+   * unreachable whenever the second half of the test holds. It is kept so the implementation and
+   * the replay agree by construction rather than by that argument.
+   */
+  lineTripped(): boolean {
+    return this.lines >= REASON_DENSITY.minRatioLines &&
+      this.lineCounts.size <= REASON_DENSITY.maxLineRatio * this.lines &&
+      this.lineTop >= REASON_DENSITY.minLineRepeats;
+  }
+
+  tripped(): boolean {
+    return this.chars >= REASON_DENSITY.minChars && (this.sentenceTripped() || this.lineTripped());
+  }
+
+  /** Counts of the line arm, for tests: non-blank lines, distinct lines and top repeat count. */
+  lineStats(): { lines: number; distinct: number; top: number } {
+    return { lines: this.lines, distinct: this.lineCounts.size, top: this.lineTop };
+  }
+}
+
 /** 每会话运行时状态。 */
 export interface SessionState {
   /** 连续自动「继续」次数; 成功回合或用户手动介入后归零。 */
@@ -850,6 +1042,12 @@ export interface SessionState {
   turnOutput: 'unknown' | 'empty' | 'silent' | 'visible';
   outputTurn: number | undefined;
   outputStartSeq: number;
+  /** vrpe F-A2: output of the current model step, from chunks and from the committed assistant message. */
+  stepOutput: 'none' | 'reasoning' | 'visible';
+  /** vrpe F-A3: reasoning units of the last committed assistant message of this turn when that message is reasoning only; else 0. */
+  reasoningOnlyUnits: number;
+  /** Reasoning-channel repetition density of the current step (vrpe). */
+  reasonDensity: ReasoningDensity;
   /** 当前连续短句数(loop guard 信号 1: 空转)。 */
   shortRun: number;
   /** 最后一条短句的时间(时间窗判定用)。 */
@@ -866,6 +1064,13 @@ export interface SessionState {
   streamRepeatRun: number;
   /** 本回合已触发过 loop guard(防重复打断)。 */
   loopFired: boolean;
+  /** 本回合检测到推理复读(与是否真的打断无关, 冷却期内被拒绝的检测也计入); 回合结束时读取并清零。 */
+  spiralTripped: boolean;
+  /**
+   * 当前复读事件已实际送出强制续跑(防复读的上限, 由 fire() 在投递成功后置位, 被拒绝或被取消的调度不占用);
+   * 可见回合完成或用户消息时清零, 回合开始不清零。
+   */
+  spiralEscalated: boolean;
   /** loop 重启的延迟定时器(冷却结束后再 schedule)。 */
   loopRetryTimer: ReturnType<typeof setTimeout> | undefined;
   /** 冷却期恢复的延迟定时器(等到冷却结束再 schedule, 而不是丢弃这次恢复)。 */
@@ -888,6 +1093,9 @@ export const freshState = (): SessionState => ({
   turnOutput: 'unknown',
   outputTurn: undefined,
   outputStartSeq: 0,
+  stepOutput: 'none',
+  reasoningOnlyUnits: 0,
+  reasonDensity: new ReasoningDensity(),
   shortRun: 0,
   lastShortAt: 0,
   lastAssistantText: '',
@@ -896,6 +1104,8 @@ export const freshState = (): SessionState => ({
   streamLastSegment: '',
   streamRepeatRun: 0,
   loopFired: false,
+  spiralTripped: false,
+  spiralEscalated: false,
   loopRetryTimer: undefined,
   cooldownRetryTimer: undefined,
 });

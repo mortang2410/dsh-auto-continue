@@ -882,9 +882,13 @@ export const REASON_DENSITY = {
  * Tool-argument runaway (kata ab45): a degenerate function-call argument stream emits an unending
  * run of whitespace and never closes its JSON. In the incident (bifrost logs.db row 171891) the
  * argument stream was 112,064 deltas: 109,513 whitespace-only, 0 empty, and the whitespace formed
- * one run of 602,620 characters. A run of pure-whitespace deltas is the signal; a non-whitespace
- * delta resets it. 16 KiB of consecutive whitespace is about 33 seconds at the incident's 494
- * whitespace characters per second.
+ * two runs, of 1 and 602,620 characters. A run of pure-whitespace deltas is the signal; a
+ * non-whitespace delta resets it. The record's 1,225.5 s latency and 602,621 whitespace-only
+ * characters give a whole-request average of about 492 characters per second, so 16 KiB is about
+ * 33 seconds at that average. The record has no per-delta times, so the trip time is an estimate.
+ *
+ * Limit: a runaway that interleaves a non-whitespace delta before the run reaches 16 KiB is not
+ * caught; the guard needs one contiguous run.
  *
  * Tradeoff: a legitimate argument that carries a whitespace-only string value (a ~16 KiB run of
  * spaces or tabs inside JSON) also trips. Accepted, because such an argument is indistinguishable

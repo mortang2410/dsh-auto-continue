@@ -1383,7 +1383,7 @@ const stepStart = (turn, step, seq) => ({
   await sleep(700);
   check(
     '英文 loop guard 文本',
-    agent.followups[0]?.content?.[0]?.text.includes('You may be stuck in a loop'),
+    agent.followups[0]?.content?.[0]?.text.includes('You are deadass in a loop'),
   );
   await sleep(50);
 }

@@ -1,7 +1,8 @@
 /** Host boundary fixture shared by focused recovery tests. */
 import { apply } from '../lib/index.js';
 
-export function makeHost(overrides = {}) {
+/** `extras.services` answers ctx.get(name); `extras.resume` answers ctx.agents.resume(options). */
+export function makeHost(overrides = {}, extras = {}) {
   const config = { scanOnBoot: true, verbose: false, graceMs: 10, cooldownMs: 0, ...overrides };
   const agents = new Map();
   const handlers = new Map();
@@ -9,7 +10,12 @@ export function makeHost(overrides = {}) {
   const cleanups = [];
   let listReads = 0;
   const ctx = {
-    agents: { list: () => { listReads += 1; return [...agents.values()]; }, get: (id) => agents.get(id) },
+    agents: {
+      list: () => { listReads += 1; return [...agents.values()]; },
+      get: (id) => agents.get(id),
+      resume: (options) => (extras.resume ? extras.resume(options) : Promise.reject(new Error('resume is not configured'))),
+    },
+    get: (name) => extras.services?.[name],
     webServer: {
       register(route) { routes.set(route.path, route); return () => routes.delete(route.path); },
     },
@@ -28,6 +34,11 @@ export function makeHost(overrides = {}) {
     listReads: () => listReads,
     start() { apply(ctx, config); },
     emit(agent, event) { for (const callback of handlers.get('session/event') ?? []) callback(agent.session, event); },
+    /** Mirrors the host's agent/disposed emit (dsh-agent/lib/index.js:547-560): one { agent } payload per listener. */
+    emitDisposed(agent) { for (const callback of handlers.get('agent/disposed') ?? []) callback({ agent }); },
+    /** Mirrors the host's agent/created emit (dsh-agent/lib/index.js:announce): one { agent } payload per listener. */
+    emitCreated(agent) { for (const callback of handlers.get('agent/created') ?? []) callback({ agent }); },
+    listenerCount(name) { return handlers.get(name)?.size ?? 0; },
     agent(id, events = []) {
       const agent = {
         session: {
@@ -36,7 +47,12 @@ export function makeHost(overrides = {}) {
         },
         reads: 0,
         followups: [],
-        inbox: { nextTurn: [] },
+        // Mirrors the real Inbox: hasPending is true while either pending list has work (dsh-agent-loop lib/index.js:88-91).
+        inbox: {
+          nextTurn: [],
+          nextStep: [],
+          get hasPending() { return this.nextTurn.length > 0 || this.nextStep.length > 0; },
+        },
         followup(message) { this.followups.push(message); },
       };
       agents.set(id, agent);
@@ -50,6 +66,15 @@ export function makeHost(overrides = {}) {
       });
       close();
       return state.stats;
+    },
+    /** Opens the state bridge like a browser tab. `frames` collects every SSE frame (state and notice); `close()` disconnects. */
+    bridge() {
+      const frames = [];
+      let close = () => {};
+      routes.get('/api/auto-continue-bridge').handler({ on(_name, callback) { close = callback; } }, {
+        writeHead() {}, end() {}, write(frame) { frames.push(JSON.parse(frame.slice(6))); },
+      });
+      return { frames, close: () => close() };
     },
     postAction(payload) {
       const route = routes.get('/api/auto-continue-action');

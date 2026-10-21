@@ -44,6 +44,21 @@ export declare class AutoContinueRunner {
     private readonly bootScannedSessions;
     private bootScanTimer;
     private wakeBootScan;
+    /** Persisted sessions are enumerated once per boot, after the service is available. */
+    private persistedEnumerated;
+    private readonly persistedDecided;
+    /** Eligible persisted sessions not yet resumed, newest activity first. */
+    private persistedQueue;
+    /** The single in-flight list() call. A stalled call is awaited again on later passes, never repeated. */
+    private persistedListing;
+    /** The single background loader pass in flight. */
+    private persistedRun;
+    /** Boot window end, set when bootScanLoop starts. Zero until then, so the loader starts no host call. */
+    private bootDeadline;
+    /** Ids the loader asked the host to resume. Their agents take only the scanLimit slots live candidates leave. */
+    private readonly persistedLoaded;
+    /** Loader-resumed agents by id until the boot scan exits. Released there if the scanner never classified them. */
+    private readonly persistedHandles;
     /**
      * @param ctx - host plugin context (agents registry, session events).
      * @param getConfig - read the current resolved configuration (entry config).
@@ -133,6 +148,36 @@ export declare class AutoContinueRunner {
     /** 上一步工具调用的护栏状态(实时路径, 由 mux 帧维护)。 */
     private currentGuard;
     private bootScanLoop;
+    /** Host calls and resumes may start only while the runner is live and the boot window is open. */
+    private persistedOpen;
+    /**
+     * Start one background loader pass unless one is already in flight. The live scan never awaits it, so a stalled
+     * host call delays only persisted loads; resumed sessions are scanned on later passes. Eligibility mirrors the
+     * scanner (persistedLastActivity). Never throws: a missing service or failing call is logged and retried later.
+     * A turn persisted as aborted/disposed on graceful shutdown is continued; a manual stop (aborted/user) is not.
+     */
+    private loadInterruptedPersisted;
+    /** One background pass: enumerate once after the services exist, then resume queued sessions within scanLimit. */
+    private runPersisted;
+    /**
+     * Enumerate once. A rejected or stalled list() leaves enumeration for a later pass. A stalled call stays in
+     * flight and is awaited again rather than repeated, so at most one list() is in flight.
+     */
+    private enumeratePersisted;
+    /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */
+    private resumeQueuedPersisted;
+    /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped. */
+    private readPersistedEntry;
+    /** Resume one persisted session through the host. A failure or stall drops it for this boot; there is no retry. */
+    private resumePersisted;
+    /** The resume itself: route, preset, then the host call. Runs under the call timeout. */
+    private resumeEntry;
+    /**
+     * Release loader-resumed agents the boot scan never classified, once the scan loop has exited. No later pass can
+     * classify them, so they would hold a write handle and never continue. Agents the scanner decided stay with the live
+     * path, as do agents that still own work: a running turn, any timer in SessionState, or queued inbox input.
+     */
+    private releaseUnscannedPersisted;
     /** Inspect newly available sessions; process each settled startup history once. */
     private scanInterrupted;
     /** 从历史事件恢复上一步工具调用状态(扫描路径的幂等护栏)。 */

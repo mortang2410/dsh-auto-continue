@@ -159,7 +159,7 @@ assert.deepEqual(
         '继续。你上一轮只输出了内部推理, 既没有回复也没有调用工具, 用户什么都没看到。每一轮都要以工具调用或可见回复结束。',
       guardPendingText: '(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)',
       guardDoneText: '(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)',
-      loopText: '(检测到你可能陷入循环, 请停止重复刚才的动作, 换一种方式继续)',
+      loopText: '你陷入循环了. 立刻做点什么, 任何事都行, 马上打破这个循环',
     },
     en: {
       continueText: 'Continue',
@@ -171,7 +171,7 @@ assert.deepEqual(
       guardDoneText:
         '(The previous tool "{tool}" completed successfully. Result: {result}; do not run it again. Continue from there.)',
       loopText:
-        '(You may be stuck in a loop. Stop repeating the last action and continue with a different approach.)',
+        'You are deadass in a loop. DO something, anything right now to break the loop',
     },
   },
 );

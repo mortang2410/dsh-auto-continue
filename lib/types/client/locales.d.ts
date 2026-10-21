@@ -107,7 +107,7 @@ export declare const zh: {
     'field.loopToolRepeatHint': string;
     'field.loopText': string;
     'field.loopTextHint': string;
-    'default.loopText': "(检测到你可能陷入循环, 请停止重复刚才的动作, 换一种方式继续)";
+    'default.loopText': "你陷入循环了. 立刻做点什么, 任何事都行, 马上打破这个循环";
     'stats.byCode': string;
     'stats.empty': string;
     'stats.reset': string;

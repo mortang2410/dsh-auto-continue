@@ -714,6 +714,12 @@ export class AutoContinueRunner {
   private readonly bootScanErrors = new WeakSet<object>();
   /** 存储扫描已裁决的会话 id, 避免每轮重复冷读大日志。 */
   private readonly storedSwept = new Set<SessionId>();
+  /**
+   * Sessions a boot path (the persisted loader or the stored sweep) has asked the host to resume. The claim is taken in the
+   * same tick as the host call, and released only when that call rejects, so a failed resume can be retried by the sweep.
+   * A pending, timed-out, or successful resume keeps its claim for this boot.
+   */
+  private readonly bootResumeClaims = new Set<SessionId>();
   /** 存储会话的连续观察/物化失败次数, 触达 SWEEP_MAX_FAILURES 后不再重试。 */
   private readonly storedSweepFailures = new Map<SessionId, number>();
   private storedSweepAnnounced = false;
@@ -2173,6 +2179,8 @@ export class AutoContinueRunner {
     const queue: PersistedEntry[] = [];
     // The stored sweep (sweepStoredSessions) materializes root sessions whenever sessionQuery exists, so the loader
     // resumes roots only on hosts without it. Children are always the loader's (continueChild), so one path per session.
+    // If sessionQuery registers after this read, the loader may already own a root; bootResumeClaims keeps the sweep from
+    // resuming that root a second time.
     const sweepOwnsRoots = this.ctx.get('sessionQuery') !== undefined;
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
@@ -2343,12 +2351,18 @@ export class AutoContinueRunner {
       this.log(`跳过 ${entry.id}: 启动窗口已结束`);
       return;
     }
+    // Checked and claimed in the same tick as the host call. A live agent or a claim from the stored sweep means this
+    // session is already resumed in this boot, so the loader stops here.
+    if (this.ctx.agents.get(entry.id) !== undefined || !this.claimBootResume(entry.id)) {
+      this.log(`skip ${entry.id}: already resumed in this boot`);
+      return;
+    }
     this.persistedLoaded.add(entry.id);
-    const handle = await this.ctx.agents.resume({
+    const handle = await this.resumeClaimed(entry.id, () => this.ctx.agents.resume({
       resumeSessionId: entry.id,
       agentOptions: { provider: route.provider, model: route.model },
       setup,
-    });
+    }));
     if (Date.now() >= this.bootDeadline) {
       // The host published the agent, but the window closed first. Release it; it is never continued.
       void handle.dispose().catch(reportLoaderError);
@@ -2913,14 +2927,17 @@ export class AutoContinueRunner {
         }
         const presetId = stored.projections?.values.agentPreset ?? stored.header.agentPreset;
         const loggedConfig = foldRequestHeader(events)?.config;
-        if (!await this.materializeStored(
+        const materialized = await this.materializeStored(
           sessionId,
           presetId,
           loggedConfig === undefined ? undefined : { provider: loggedConfig.provider, model: loggedConfig.model },
-        )) {
+        );
+        if (materialized === 'stopped') {
           this.storedSwept.delete(sessionId);
           return;
         }
+        // A boot resume already owns this session (the loader, or a live agent): nothing is materialized here.
+        if (materialized === 'claimed') continue;
         this.storedSweepFailures.delete(sessionId);
         this.wakeBootScan?.();
         this.ctx.logger.info(openTurn
@@ -2959,8 +2976,8 @@ export class AutoContinueRunner {
     sessionId: SessionId,
     presetId: string | undefined,
     logged: { provider: string; model: string } | undefined,
-  ): Promise<boolean> {
-    if (this.disposed || this.sessionConfig(sessionId).paused || !this.getConfig().scanOnBoot) return false;
+  ): Promise<'materialized' | 'claimed' | 'stopped'> {
+    if (this.disposed || this.sessionConfig(sessionId).paused || !this.getConfig().scanOnBoot) return 'stopped';
     const presets = this.ctx.get('agentPresets');
     // Mirrors session-controller's adopt: without agent options the agent has no
     // provider/model, so prompt variables like {{model}} have no value and the
@@ -2970,22 +2987,49 @@ export class AutoContinueRunner {
     const agentOptions = logged !== undefined
       ? { provider: logged.provider, model: logged.model }
       : selection === undefined ? undefined : { provider: selection.provider, model: selection.model };
+    // Checked and claimed in the same tick as the host call: no await sits between the check and the claim. A live agent
+    // or an earlier boot claim (the loader's resume, still pending or already settled) means nothing is resumed here.
     if (presets === undefined) {
-      await this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, signal: this.stopStoredSweep.signal });
-      return true;
+      if (this.ctx.agents.get(sessionId) !== undefined || !this.claimBootResume(sessionId)) return 'claimed';
+      await this.resumeClaimed(sessionId, () => this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        signal: this.stopStoredSweep.signal,
+      }));
+      return 'materialized';
     }
     const resolvedId = (await presets.resolve(presetId)).id;
-    if (this.disposed || this.sessionConfig(sessionId).paused || !this.getConfig().scanOnBoot) return false;
-    if (this.ctx.agents.get(sessionId) !== undefined) return true;
-    await this.ctx.agents.resume({
+    if (this.disposed || this.sessionConfig(sessionId).paused || !this.getConfig().scanOnBoot) return 'stopped';
+    if (this.ctx.agents.get(sessionId) !== undefined || !this.claimBootResume(sessionId)) return 'claimed';
+    await this.resumeClaimed(sessionId, () => this.ctx.agents.resume({
       resumeSessionId: sessionId,
       agentOptions,
       signal: this.stopStoredSweep.signal,
       setup: async (agentCtx) => {
         await presets.mount(agentCtx, resolvedId);
       },
-    });
+    }));
+    return 'materialized';
+  }
+
+  /** Take the boot claim for one session. False when a boot resume already owns it (pending, timed out, or succeeded). */
+  private claimBootResume(sessionId: SessionId): boolean {
+    if (this.bootResumeClaims.has(sessionId)) return false;
+    this.bootResumeClaims.add(sessionId);
     return true;
+  }
+
+  /**
+   * Await a claimed host resume. A rejection releases the claim, so the stored sweep may retry the session. A call that is
+   * still pending keeps its claim, including one the loader has stopped waiting for, because a late resume may still publish.
+   */
+  private async resumeClaimed<T>(sessionId: SessionId, call: () => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (error) {
+      this.bootResumeClaims.delete(sessionId);
+      throw error;
+    }
   }
 
   /** Captured identity only: even session.id can throw when the header is damaged. */

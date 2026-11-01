@@ -73,6 +73,12 @@ export declare class AutoContinueRunner {
     private readonly bootScanErrors;
     /** 存储扫描已裁决的会话 id, 避免每轮重复冷读大日志。 */
     private readonly storedSwept;
+    /**
+     * Sessions a boot path (the persisted loader or the stored sweep) has asked the host to resume. The claim is taken in the
+     * same tick as the host call, and released only when that call rejects, so a failed resume can be retried by the sweep.
+     * A pending, timed-out, or successful resume keeps its claim for this boot.
+     */
+    private readonly bootResumeClaims;
     /** 存储会话的连续观察/物化失败次数, 触达 SWEEP_MAX_FAILURES 后不再重试。 */
     private readonly storedSweepFailures;
     private storedSweepAnnounced;
@@ -376,6 +382,13 @@ export declare class AutoContinueRunner {
      * 加的合成 turn/end(`interrupted`)随后由常规扫描按既有关卡恢复。
      */
     private materializeStored;
+    /** Take the boot claim for one session. False when a boot resume already owns it (pending, timed out, or succeeded). */
+    private claimBootResume;
+    /**
+     * Await a claimed host resume. A rejection releases the claim, so the stored sweep may retry the session. A call that is
+     * still pending keeps its claim, including one the loader has stopped waiting for, because a late resume may still publish.
+     */
+    private resumeClaimed;
     /** Captured identity only: even session.id can throw when the header is damaged. */
     private logBootScanFailure;
     /** 从历史事件恢复上一步工具调用状态(扫描路径的幂等护栏)。 */

@@ -7,6 +7,15 @@
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types';
 /** Supported UI/config locales. Any unknown browser locale falls back to Chinese. */
 export type AutoContinueLocale = 'en' | 'zh';
+export type SessionMode = 'default' | 'off' | 'recover' | 'loop';
+export interface SessionPolicy {
+    modes: Record<string, SessionMode>;
+    defaultMode: 'recover' | 'loop';
+    paused: boolean;
+    writable: boolean;
+}
+export declare const isSessionMode: (value: unknown) => value is SessionMode;
+export declare function sessionMode(modes: Record<string, SessionMode>, sessionId: string): SessionMode;
 /** Locale-owned defaults for the user-editable text fields. */
 export declare const LOCALIZED_TEXT_DEFAULTS: {
     readonly zh: {
@@ -14,6 +23,7 @@ export declare const LOCALIZED_TEXT_DEFAULTS: {
         readonly continueTextMaxTokens: "继续";
         readonly continueTextSilent: "继续。你上一轮只输出了内部推理, 既没有回复也没有调用工具, 用户什么都没看到。每一轮都要以工具调用或可见回复结束。";
         readonly continueTextLoop: "继续";
+        readonly continueTextInterrupted: "继续。宿主在你上一轮运行期间重启了; 重启时未完成的工具调用已按「结果未知」收尾。从中断处继续, 重试可能有副作用的操作前先核实外部状态。";
         readonly guardPendingText: "(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)";
         readonly guardDoneText: "(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)";
         readonly loopText: "你陷入循环了. 立刻做点什么, 任何事都行, 马上打破这个循环";
@@ -23,6 +33,7 @@ export declare const LOCALIZED_TEXT_DEFAULTS: {
         readonly continueTextMaxTokens: "Continue";
         readonly continueTextSilent: "Continue. Your previous turn ended with internal reasoning only, with no message and no tool call, so nothing reached the user. Always finish a turn with a tool call or a visible answer.";
         readonly continueTextLoop: "Continue";
+        readonly continueTextInterrupted: "Continue. The harness was restarted while your previous turn was still running; tool calls pending at the restart are recorded with unknown outcomes. Resume where you left off, verifying external state before retrying anything that may have side effects.";
         readonly guardPendingText: "(The previous tool \"{tool}\" may not have completed. Check its state before continuing and do not run it again.)";
         readonly guardDoneText: "(The previous tool \"{tool}\" completed successfully. Result: {result}; do not run it again. Continue from there.)";
         readonly loopText: "You are deadass in a loop. DO something, anything right now to break the loop";
@@ -44,6 +55,8 @@ export interface AutoContinueSettings {
     continueTextSilent?: string;
     /** Text sent for each autonomous-loop continuation (same placeholders as `continueText`). */
     continueTextLoop?: string;
+    /** Text sent when a turn is recovered after a harness restart closed it as interrupted. */
+    continueTextInterrupted?: string;
     /** Idempotency guard: inspect the last tool call before resuming and steer the model. */
     guardTools?: boolean;
     /** Guard text appended when the last tool call has no confirmed result (it may have partially executed). */
@@ -76,10 +89,14 @@ export interface AutoContinueSettings {
     notify?: boolean;
     /** Globally pause auto-continue: no live or scan send, queued pending sends cancelled. */
     paused?: boolean;
-    /** Show the global auto-continue switch in the conversation composer. */
+    /** Persistent per-session overrides; default explicitly inherits the profile default. */
+    sessionModes?: Record<string, SessionMode>;
+    /** Show the session mode selector in the conversation composer. */
     showComposerToggle?: boolean;
     /** Loop guard: detect a running turn spinning in place (short talk without tools, or the same tool repeating) and restart it. */
     loopGuard?: boolean;
+    /** Live channel guard: also read reasoning spirals from live assistant-stream chunk frames (vrpe). Off by default. */
+    liveStreamGuard?: boolean;
     /** A model message shorter than this many chars counts as a "short sentence" (loop signal). */
     loopShortChars?: number;
     /** Consecutive short sentences within this window (ms) with no tool call in between trip the loop guard. */
@@ -255,6 +272,13 @@ export declare class ToolInvocationTracker {
 /** 自适应退避: 同一会话连续失败时的有效冷却间隔。 */
 export declare function effectiveCooldown(consecutive: number, base: number, factor: number, max: number): number;
 export declare function sleep(ms: number): Promise<void>;
+/** A sent recovery prompt, not proof that the following turn succeeded. */
+export interface RecoveryAttempt {
+    sessionId: string;
+    at: number;
+    reason: 'error' | 'max-tokens' | 'silent' | 'interrupted' | 'loop-guard' | 'manual';
+    consecutive: number;
+}
 /** 一天的自动继续统计(host 单实例内存态)。 */
 export interface DayStats {
     /** 本地日期 YYYY-MM-DD。 */
@@ -277,6 +301,151 @@ export interface DayStats {
 export declare function todayKey(): string;
 /** 空统计桶。 */
 export declare function emptyDayStats(): DayStats;
+/**
+ * Reasoning-spiral thresholds (kata vrpe). A reasoning-only step trips once it has `minChars`
+ * reasoning characters and either arm of the spiral test fires:
+ *
+ *   sentence arm: `minSentences` counted sentences with a unique-sentence ratio at most
+ *                 `maxUniqueRatio` (the original rule, unchanged);
+ *   line arm:     a distinct-line ratio at most `maxLineRatio` and a most-common-line count of
+ *                 at least `minLineRepeats`, over the non-blank lines of the step.
+ *
+ * The line arm catches what the sentence arm cannot: a spiral whose repeated lines are short, so
+ * a splitter that discards segments of `minSentenceChars` characters or fewer never sees the
+ * repetition (measured on the tuning corpus: 22 of the 25 labelled spiral steps). The sentence
+ * arm stays because the reverse shape exists: one newline-free run of tens of thousands of
+ * characters is only a handful of distinct lines, so the line arm cannot see it while its
+ * sentences repeat (measured: session-0cb0f4f2-7286-4542-b740-2a7467f47eb3 step 68).
+ *
+ * Why the line arm looks at the whole step and not a sliding window. The corpus candidate was a
+ * checkpointed series over the gated text at p = 8000, 8500, ..., and those are the columns the
+ * frozen table prices. The shipped rule instead evaluates the step's own reasoning, because the
+ * guard must act mid-stream: checkpoints are fixed offsets (up to 499 characters stale) and the
+ * counts and their thresholds would have to change meaning as a window slides, while the
+ * whole-step form fires as soon as the step's reasoning is degenerate.
+ *
+ * One known divergence from the frozen columns, in the shipped rule's favor. The table's
+ * `line_full_*` columns include the reasoning text's trailing fragment, the part after the last
+ * newline, while this code counts only lines that a newline has ended: mid-stream that fragment is
+ * still being extended, and counting it as a line would let it be counted twice once it is
+ * terminated. Excluding it lowers the distinct-over-total ratio, so the shipped rule is slightly
+ * MORE sensitive than the columns at that boundary and can trip where the table would not. The
+ * review measured 121 such one-way flips and none in the other direction, so the corpus trip counts
+ * are a lower bound on the shipped rule's recall, and the zero false positives hold under the
+ * stricter reading too, because the false-positive population is caught by the repeat count.
+ */
+export declare const REASON_DENSITY: {
+    readonly minChars: 8000;
+    readonly minSentences: 150;
+    readonly maxUniqueRatio: 0.35;
+    readonly minSentenceChars: 15;
+    readonly maxSentenceChars: 1000;
+    /** Line arm: distinct non-blank lines divided by non-blank lines must not exceed this. */
+    readonly maxLineRatio: 0.3;
+    /** Line arm: the most common non-blank line must occur at least this many times. */
+    readonly minLineRepeats: 300;
+    /** Line arm: the distinct-line ratio is only defined from this many non-blank lines (replay floor). */
+    readonly minRatioLines: 20;
+    /**
+     * Line arm: the longest unterminated tail kept while waiting for the newline that ends a line.
+     * The tail is dropped above this, so a step that never emits a newline cannot retain its whole
+     * reasoning text. Set above the corpus maximum non-blank line (35,586 characters, session
+     * 0cb0f4f2 step 68) so no line that any measured step counts is lost; the margin is 29,950.
+     */
+    readonly maxLineChars: 65536;
+};
+/**
+ * Tool-argument runaway (kata ab45): a degenerate function-call argument stream emits an unending
+ * run of whitespace and never closes its JSON. In the incident (bifrost logs.db row 171891) the
+ * argument stream was 112,064 deltas: 109,513 whitespace-only, 0 empty, and the whitespace formed
+ * two runs, of 1 and 602,620 characters. A run of pure-whitespace deltas is the signal; a
+ * non-whitespace delta resets it. The record's 1,225.5 s latency and 602,621 whitespace-only
+ * characters give a whole-request average of about 492 characters per second, so 16 KiB is about
+ * 33 seconds at that average. The record has no per-delta times, so the trip time is an estimate.
+ *
+ * Limit: a runaway that interleaves a non-whitespace delta before the run reaches 16 KiB is not
+ * caught; the guard needs one contiguous run.
+ *
+ * Tradeoff: a legitimate argument that carries a whitespace-only string value (a ~16 KiB run of
+ * spaces or tabs inside JSON) also trips. Accepted, because such an argument is indistinguishable
+ * from the runaway in the delta stream. The run resets at each step and each model attempt (a
+ * retried attempt regenerates the argument stream); within one attempt the run persists.
+ */
+export declare const TOOL_ARG_GUARD: {
+    readonly whitespaceRunChars: 16384;
+};
+/** Streaming repetition density over the reasoning channel of one step. */
+export declare class ReasoningDensity {
+    private chars;
+    private sentences;
+    private buffer;
+    private readonly counts;
+    /**
+     * Line arm state: the reasoning text of the step so far. Lines can still be extended by a later
+     * delta, so a line is only counted once the newline that ends it has arrived. Only the counters
+     * and this tail are kept; the text is dropped on reset.
+     */
+    private lineTail;
+    private lines;
+    private readonly lineCounts;
+    private lineTop;
+    /** Latched on the first trip of the step (vrpe X-M2): later deltas return true without counting. */
+    private latched;
+    /** The trip log is written once per step (vrpe X-M2). */
+    tripLogged: boolean;
+    /** The cooldown refusal log is written once per step (vrpe X-M2). */
+    refusalLogged: boolean;
+    reset(): void;
+    /** Feed one reasoning delta; true once the step meets the spiral thresholds, and it stays true after. */
+    feed(text: string): boolean;
+    /**
+     * Count every line completed by this delta. Only `\n` ends a line; a `\r` before it is part of
+     * the line and is removed by trim, so CRLF reasoning counts as the replay's LF form. A line
+     * that is empty or whitespace only is not counted, which mirrors the replay's non-blank rule.
+     *
+     * The tail is capped for the same reason the sentence buffer is: a step that never emits a
+     * newline would otherwise retain its whole reasoning text here. Measured on the uncapped version,
+     * retained state was 9.10 MB for a 10,000,000 character step, against 0.06 MB with the cap.
+     *
+     * The invariant is `lineTail.length <= maxLineChars`, not "the tail is empty". This method
+     * appends before it tests, so the tail grows to the cap, drops to empty, and regrows: a run of
+     * deltas with no newline ends with a tail of whatever the last append left, which is at most the
+     * cap. A dropped tail is not counted, so no candidate line is invented.
+     *
+     * Two consequences worth knowing. A completed line is always counted, however long, because it
+     * sits before the last newline when the cap is applied. An unterminated line longer than the cap
+     * is dropped, and whether that loses a line depends on how the stream was chunked: one delta that
+     * contains the newline keeps a line of any length, while the same line streamed in pieces is
+     * lost once the tail passes the cap. Only lines longer than `maxLineChars` are affected, which is
+     * 1.8 times the longest line in the corpus, and both effects move the ratio toward tripping while
+     * leaving the repeat count untouched, so the error is on the safe side.
+     */
+    private feedLines;
+    private countLine;
+    /**
+     * Sentence arm: enough counted sentences and few enough distinct sentences. Unchanged.
+     */
+    private sentenceTripped;
+    /**
+     * Line arm: enough non-blank lines, few enough distinct non-blank lines, and one line repeated
+     * often enough. The comparisons are the replay's: `distinct <= maxLineRatio * lines` with the
+     * distinct count as an integer, and `top >= minLineRepeats`.
+     *
+     * `minRatioLines` is the replay's `nb >= 20` floor, below which it does not define the ratio at
+     * all (measure_v4/spiral_replay_v4.py, the `nb_p >= LN_MIN_NB` guard). The floor cannot change a
+     * verdict: `top >= minLineRepeats` already forces at least 300 non-blank lines, so the floor is
+     * unreachable whenever the second half of the test holds. It is kept so the implementation and
+     * the replay agree by construction rather than by that argument.
+     */
+    lineTripped(): boolean;
+    tripped(): boolean;
+    /** Counts of the line arm, for tests: non-blank lines, distinct lines and top repeat count. */
+    lineStats(): {
+        lines: number;
+        distinct: number;
+        top: number;
+    };
+}
 /** 每会话运行时状态。 */
 export interface SessionState {
     /** 连续自动「继续」次数; 成功回合或用户手动介入后归零。 */
@@ -287,6 +456,7 @@ export interface SessionState {
     pendingEchoMessageIds: Map<string, number>;
     /** 宽限期定时器(进行中的待发送)。 */
     pendingTimer: ReturnType<typeof setTimeout> | undefined;
+    pendingReason?: string;
     /** 宿主权威 running 位(来自 host/session-status 与回合事件)。 */
     running: boolean | undefined;
     /** 当前排队消息数(来自 session/queue 帧)。 */
@@ -307,6 +477,19 @@ export interface SessionState {
     turnOutput: 'unknown' | 'empty' | 'silent' | 'visible';
     outputTurn: number | undefined;
     outputStartSeq: number;
+    /** vrpe F-A2: output of the current model step, from chunks and from the committed assistant message. */
+    stepOutput: 'none' | 'reasoning' | 'visible';
+    /** vrpe F-A3: reasoning units of the last committed assistant message of this turn when that message is reasoning only; else 0. */
+    reasoningOnlyUnits: number;
+    /** Reasoning-channel repetition density of the current step (vrpe). */
+    reasonDensity: ReasoningDensity;
+    /** kata ab45: consecutive whitespace-only tool-argument characters in this step. */
+    toolArgWhitespaceRun: number;
+    /** kata ab45: the trip and the cooldown refusal are each logged once per step. */
+    toolArgTripLogged: boolean;
+    toolArgCooldownLogged: boolean;
+    /** message-ops maintenance window, which must not enter model recovery or loop accounting. */
+    maintenanceTurn?: number;
     /** 当前连续短句数(loop guard 信号 1: 空转)。 */
     shortRun: number;
     /** 最后一条短句的时间(时间窗判定用)。 */
@@ -315,6 +498,16 @@ export interface SessionState {
     lastAssistantText: string;
     /** 连续相同文本消息数(最强空转信号, 不限长度)。 */
     sameTextRun: number;
+    /**
+     * Normalised reasoning of the last reasoning-only message (the reasoning repeat arm compares against it).
+     * Not reset by turn start, so a stall that spans turns still accumulates.
+     */
+    reasoningRepeatText: string;
+    /**
+     * Consecutive reasoning-only messages repeating reasoningRepeatText. Reset by visible output, a fresh tool call
+     * and a loop interrupt. Not reset by turn start.
+     */
+    reasoningRepeatRun: number;
     /** 流式消息尚未闭合的有界尾段(assistant/chunk 增量分段检测用)。 */
     streamTail: string;
     /** 流式消息最近一个长段的归一化文本。 */

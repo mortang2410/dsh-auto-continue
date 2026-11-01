@@ -9,6 +9,22 @@ import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types';
 /** Supported UI/config locales. Any unknown browser locale falls back to Chinese. */
 export type AutoContinueLocale = 'en' | 'zh';
 
+export type SessionMode = 'default' | 'off' | 'recover' | 'loop';
+
+export interface SessionPolicy {
+  modes: Record<string, SessionMode>;
+  defaultMode: 'recover' | 'loop';
+  paused: boolean;
+  writable: boolean;
+}
+
+export const isSessionMode = (value: unknown): value is SessionMode =>
+  value === 'default' || value === 'off' || value === 'recover' || value === 'loop';
+
+export function sessionMode(modes: Record<string, SessionMode>, sessionId: string): SessionMode {
+  return Object.prototype.hasOwnProperty.call(modes, sessionId) && isSessionMode(modes[sessionId]) ? modes[sessionId]! : 'default';
+}
+
 /** Locale-owned defaults for the user-editable text fields. */
 export const LOCALIZED_TEXT_DEFAULTS = {
   zh: {
@@ -17,6 +33,8 @@ export const LOCALIZED_TEXT_DEFAULTS = {
     continueTextSilent:
       '继续。你上一轮只输出了内部推理, 既没有回复也没有调用工具, 用户什么都没看到。每一轮都要以工具调用或可见回复结束。',
     continueTextLoop: '继续',
+    continueTextInterrupted:
+      '继续。宿主在你上一轮运行期间重启了; 重启时未完成的工具调用已按「结果未知」收尾。从中断处继续, 重试可能有副作用的操作前先核实外部状态。',
     guardPendingText: '(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)',
     guardDoneText: '(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)',
     loopText: '你陷入循环了. 立刻做点什么, 任何事都行, 马上打破这个循环',
@@ -27,6 +45,8 @@ export const LOCALIZED_TEXT_DEFAULTS = {
     continueTextSilent:
       'Continue. Your previous turn ended with internal reasoning only, with no message and no tool call, so nothing reached the user. Always finish a turn with a tool call or a visible answer.',
     continueTextLoop: 'Continue',
+    continueTextInterrupted:
+      'Continue. The harness was restarted while your previous turn was still running; tool calls pending at the restart are recorded with unknown outcomes. Resume where you left off, verifying external state before retrying anything that may have side effects.',
     guardPendingText:
       '(The previous tool "{tool}" may not have completed. Check its state before continuing and do not run it again.)',
     guardDoneText:
@@ -52,6 +72,8 @@ export interface AutoContinueSettings {
   continueTextSilent?: string;
   /** Text sent for each autonomous-loop continuation (same placeholders as `continueText`). */
   continueTextLoop?: string;
+  /** Text sent when a turn is recovered after a harness restart closed it as interrupted. */
+  continueTextInterrupted?: string;
   /** Idempotency guard: inspect the last tool call before resuming and steer the model. */
   guardTools?: boolean;
   /** Guard text appended when the last tool call has no confirmed result (it may have partially executed). */
@@ -84,7 +106,9 @@ export interface AutoContinueSettings {
   notify?: boolean;
   /** Globally pause auto-continue: no live or scan send, queued pending sends cancelled. */
   paused?: boolean;
-  /** Show the global auto-continue switch in the conversation composer. */
+  /** Persistent per-session overrides; default explicitly inherits the profile default. */
+  sessionModes?: Record<string, SessionMode>;
+  /** Show the session mode selector in the conversation composer. */
   showComposerToggle?: boolean;
   /** Loop guard: detect a running turn spinning in place (short talk without tools, or the same tool repeating) and restart it. */
   loopGuard?: boolean;
@@ -128,6 +152,7 @@ export const DEFAULT_CONFIG: AutoContinueConfig = {
   backoffMaxMs: 300000,
   notify: false,
   paused: false,
+  sessionModes: {},
   showComposerToggle: true,
   loopGuard: true,
   liveStreamGuard: false,
@@ -167,6 +192,10 @@ export function resolveConfig(section: AutoContinueSettings | undefined): AutoCo
     typeof value.continueTextLoop === 'string' && value.continueTextLoop.trim() !== ''
       ? value.continueTextLoop
       : localized.continueTextLoop;
+  const interruptedText =
+    typeof value.continueTextInterrupted === 'string' && value.continueTextInterrupted.trim() !== ''
+      ? value.continueTextInterrupted
+      : localized.continueTextInterrupted;
   const guardPendingText =
     typeof value.guardPendingText === 'string' && value.guardPendingText.trim() !== ''
       ? value.guardPendingText
@@ -183,6 +212,7 @@ export function resolveConfig(section: AutoContinueSettings | undefined): AutoCo
     resumeCompletedTurns: booleanOr(value.resumeCompletedTurns, DEFAULT_CONFIG.resumeCompletedTurns),
     continueTextSilent: silentText,
     continueTextLoop: loopText,
+    continueTextInterrupted: interruptedText,
     guardTools: booleanOr(value.guardTools, DEFAULT_CONFIG.guardTools),
     guardPendingText,
     guardDoneText,
@@ -202,6 +232,8 @@ export function resolveConfig(section: AutoContinueSettings | undefined): AutoCo
     backoffMaxMs: numberOr(value.backoffMaxMs, DEFAULT_CONFIG.backoffMaxMs),
     notify: booleanOr(value.notify, DEFAULT_CONFIG.notify),
     paused: booleanOr(value.paused, DEFAULT_CONFIG.paused),
+    sessionModes: value.sessionModes !== null && typeof value.sessionModes === 'object' && !Array.isArray(value.sessionModes)
+      ? value.sessionModes : {},
     showComposerToggle: booleanOr(value.showComposerToggle, DEFAULT_CONFIG.showComposerToggle),
     loopGuard: booleanOr(value.loopGuard, DEFAULT_CONFIG.loopGuard),
     liveStreamGuard: booleanOr(value.liveStreamGuard, DEFAULT_CONFIG.liveStreamGuard),
@@ -260,7 +292,8 @@ export function isTransientFailure(failure: FailureFacts, retryableErrorPatterns
     /insufficient.*(balance|quota)|billing|payment|quota.*exceeded.*(?!retry)/i.test(haystack) ||
     /model.*not[_-]?found|unknown[_-]?model|model[_-]?not[_-]?found|not.*support.*model/i.test(haystack) ||
     /context.*(length|limit|overflow|exceed)|token.*limit|max.*context/i.test(haystack) ||
-    /invalid[_-]?request|bad[_-]?request/i.test(haystack);
+    /invalid[_-]?request|bad[_-]?request/i.test(haystack) ||
+    /prompt variable "\{\{[^"\r\n]+\}\}" has no value for this assembly/i.test(haystack);
   return !permanent;
 }
 
@@ -792,6 +825,14 @@ function clientTimeZone(): string | undefined {
   }
 }
 
+/** A sent recovery prompt, not proof that the following turn succeeded. */
+export interface RecoveryAttempt {
+  sessionId: string;
+  at: number;
+  reason: 'error' | 'max-tokens' | 'silent' | 'interrupted' | 'loop-guard' | 'manual';
+  consecutive: number;
+}
+
 /** 一天的自动继续统计(host 单实例内存态)。 */
 export interface DayStats {
   /** 本地日期 YYYY-MM-DD。 */
@@ -1043,6 +1084,7 @@ export interface SessionState {
   pendingEchoMessageIds: Map<string, number>;
   /** 宽限期定时器(进行中的待发送)。 */
   pendingTimer: ReturnType<typeof setTimeout> | undefined;
+  pendingReason?: string;
   /** 宿主权威 running 位(来自 host/session-status 与回合事件)。 */
   running: boolean | undefined;
   /** 当前排队消息数(来自 session/queue 帧)。 */
@@ -1074,6 +1116,8 @@ export interface SessionState {
   /** kata ab45: the trip and the cooldown refusal are each logged once per step. */
   toolArgTripLogged: boolean;
   toolArgCooldownLogged: boolean;
+  /** message-ops maintenance window, which must not enter model recovery or loop accounting. */
+  maintenanceTurn?: number;
   /** 当前连续短句数(loop guard 信号 1: 空转)。 */
   shortRun: number;
   /** 最后一条短句的时间(时间窗判定用)。 */
@@ -1082,6 +1126,16 @@ export interface SessionState {
   lastAssistantText: string;
   /** 连续相同文本消息数(最强空转信号, 不限长度)。 */
   sameTextRun: number;
+  /**
+   * Normalised reasoning of the last reasoning-only message (the reasoning repeat arm compares against it).
+   * Not reset by turn start, so a stall that spans turns still accumulates.
+   */
+  reasoningRepeatText: string;
+  /**
+   * Consecutive reasoning-only messages repeating reasoningRepeatText. Reset by visible output, a fresh tool call
+   * and a loop interrupt. Not reset by turn start.
+   */
+  reasoningRepeatRun: number;
   /** 流式消息尚未闭合的有界尾段(assistant/chunk 增量分段检测用)。 */
   streamTail: string;
   /** 流式消息最近一个长段的归一化文本。 */
@@ -1129,6 +1183,8 @@ export const freshState = (): SessionState => ({
   lastShortAt: 0,
   lastAssistantText: '',
   sameTextRun: 0,
+  reasoningRepeatText: '',
+  reasoningRepeatRun: 0,
   streamTail: '',
   streamLastSegment: '',
   streamRepeatRun: 0,

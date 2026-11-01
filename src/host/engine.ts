@@ -15,9 +15,9 @@
 
 import type { Context } from '@deepseek-ai/cordis';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import type { Agent, AgentHandle, AssistantStreamFrame } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent';
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types';
-import type { Session } from '@deepseek-ai/dsh-session';
+import { foldRequestHeader, type Session } from '@deepseek-ai/dsh-session';
 import {
   DEFAULT_CONFIG,
   RECOVERY_WINDOW_MS,
@@ -32,6 +32,7 @@ import {
   isTransientAgentError,
   isTransientFailure,
   resolveConfig,
+  sessionMode,
   sleep,
   todayKey,
   trackPendingEcho,
@@ -39,6 +40,7 @@ import {
   type AutoContinueConfig,
   type AutoContinueLocale,
   type DayStats,
+  type RecoveryAttempt,
   type FailureFacts,
   type SessionState,
   type NotifyAction,
@@ -88,6 +90,21 @@ const NOTICE_COPY = {
 /** One model stream chunk, as carried by a session `assistant/chunk` event. */
 type AssistantChunk = SessionEvent<'assistant/chunk'>['data']['chunk'];
 
+/**
+ * The live host's `agent/assistant-stream` frame, narrowed to the fields this plugin reads. The pinned
+ * dsh-agent 0.1.2-rc.1 types do not declare it; the live host (dsh-agent 0.2.0-rc.2) does.
+ */
+type AssistantStreamFrame =
+  | { readonly type: 'start' }
+  | { readonly type: 'chunk'; readonly chunk: AssistantChunk }
+  | { readonly type: 'end' };
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'agent/assistant-stream'(payload: { agent: Agent; frame: AssistantStreamFrame }): void;
+  }
+}
+
 const LOOP_GUARD_CANCEL_CAUSE = {
   kind: 'hook',
   reason: 'dsh-auto-continue:loop-guard',
@@ -122,6 +139,25 @@ const SILENT_REASONING_SKIP_UNITS = 8000;
  */
 const LOOP_SPIRAL_SCAN_MESSAGES = 32;
 const MANUAL_NOTIFICATION_REASON = 'manual:notification';
+
+/** Yield between storage batches without spending a live-scan polling interval. */
+const SWEEP_OBSERVE_BATCH = 16;
+const STORED_READ_TIMEOUT_MS = 5000;
+/** 单个存储会话连续观察/物化失败达此数后放弃, 避免坏日志反复占满每轮观察配额。 */
+const SWEEP_MAX_FAILURES = 3;
+
+/**
+ * 存储扫描消费的宿主服务结构类型。这些服务(sessionQuery 等)随 dsh
+ * 版本整组演进, 直接引类型包会拖动 devDependency 时代; 按消费面声明,
+ * 缺服务的宿主在运行时禁用存储扫描即可。
+ */
+interface StoredObservation {
+  readonly events: readonly SessionEvent[];
+  readonly header: { readonly id?: SessionId; readonly origin?: string; readonly agentPreset?: string };
+  readonly projections?: { readonly values: { readonly agentPreset?: string } };
+  [Symbol.dispose]?: () => void;
+}
+
 const isLoopReason = (reason: string): boolean =>
   reason === LOOP_COMPLETED_REASON || reason === LOOP_SILENT_REASON;
 
@@ -129,6 +165,9 @@ const isLoopReason = (reason: string): boolean =>
 const STREAM_NEAR_DUPLICATE_MAX_CHARS = 2_048;
 /** Bound unfinished text copied between token chunks when a provider emits no paragraph break. */
 const STREAM_TAIL_MAX_CHARS = 4_096;
+
+/** Ignore invisible formatting only for detection, never rewrite the stored message. */
+const visibleText = (text: string): string => text.replace(/\p{Cf}/gu, '').trim();
 
 /** 通知桥事件: host 引擎产生, browser 侧订阅展示(Notification / 动作按钮)。 */
 export interface HostNotice {
@@ -157,9 +196,38 @@ type CompatibleSession = Session & {
 /** Read one stable event-log snapshot on both legacy and DSH 0.1.2 hosts. */
 function snapshotSessionEvents(session: Session): readonly SessionEvent[] {
   const compatible = session as CompatibleSession;
-  if (typeof compatible.snapshotEvents === 'function') return compatible.snapshotEvents();
-  if (compatible.events !== undefined) return compatible.events;
-  throw new TypeError('session exposes neither snapshotEvents() nor events');
+  const snapshot = compatible.snapshotEvents;
+  const events = typeof snapshot === 'function' ? snapshot.call(session) : compatible.events;
+  return validateSessionEvents(events);
+}
+
+function validateSessionEvents(events: unknown): readonly SessionEvent[] {
+  if (!Array.isArray(events)) throw new TypeError('session history is not an event array');
+  // Do not filter damaged entries: one could have been a manual stop, newer turn,
+  // or tool result. An incomplete history is not safe evidence for a continuation.
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event === null || typeof event !== 'object' || Array.isArray(event) ||
+        typeof event.type !== 'string' || event.type === '' ||
+        !Number.isSafeInteger(event.seq) || event.seq < 0 ||
+        !Number.isFinite(event.time) || event.time < 0) {
+      throw new TypeError(`invalid session event envelope at index ${index}`);
+    }
+  }
+  return events;
+}
+
+function latestTurnStart(events: readonly SessionEvent[]): SessionEvent<'turn/start'> | undefined {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event?.type === 'turn/start') return event;
+  }
+  return undefined;
+}
+
+function isMaintenanceTurnStart(event: SessionEvent<'turn/start'> | undefined): boolean {
+  // shortcut: only message-ops defines this marker; extend when another producer has a verified contract.
+  return (event?.data as { reason?: unknown } | undefined)?.reason === 'message-ops';
 }
 
 /** Interpret host failure payloads without trusting persisted or plugin-provided event shapes. */
@@ -223,6 +291,16 @@ function reasoningUnits(content: unknown): number {
     if (part?.type === 'reasoning' && typeof part.text === 'string') units += part.text.length;
   }
   return units;
+}
+
+/** Concatenated text of the reasoning parts of a message content (the reasoning repeat arm's key, before normalising). */
+function reasoningText(content: unknown): string {
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const part of content as { type?: unknown; text?: unknown }[]) {
+    if (part?.type === 'reasoning' && typeof part.text === 'string') text += part.text;
+  }
+  return text;
 }
 
 /**
@@ -621,6 +699,7 @@ export class AutoContinueRunner {
   private readonly states = new Map<SessionId, SessionState>();
   private readonly pauseUntil = new Map<SessionId, number>();
   private dayStats: DayStats = emptyDayStats();
+  private readonly recoveryAttempts: RecoveryAttempt[] = [];
   private readonly notices: HostNotice[] = [];
   private readonly noticeListeners = new Set<() => void>();
   private readonly stateListeners = new Set<() => void>();
@@ -631,6 +710,13 @@ export class AutoContinueRunner {
   private readonly disposeAssistantStream: (() => void) | undefined;
   private disposed = false;
   private readonly bootScannedSessions = new WeakSet<Session>();
+  /** Also bound diagnostics when even an agent's session getter is unavailable. */
+  private readonly bootScanErrors = new WeakSet<object>();
+  /** 存储扫描已裁决的会话 id, 避免每轮重复冷读大日志。 */
+  private readonly storedSwept = new Set<SessionId>();
+  /** 存储会话的连续观察/物化失败次数, 触达 SWEEP_MAX_FAILURES 后不再重试。 */
+  private readonly storedSweepFailures = new Map<SessionId, number>();
+  private storedSweepAnnounced = false;
   private bootScanTimer: ReturnType<typeof setTimeout> | undefined;
   private wakeBootScan: (() => void) | undefined;
   /** Persisted sessions are enumerated once per boot, after the service is available. */
@@ -662,6 +748,8 @@ export class AutoContinueRunner {
   private disposeParentListener: (() => void) | undefined;
   /** Log-only timer at the boot window end. Set while a child waits. It never sends. */
   private slotWindowTimer: ReturnType<typeof setTimeout> | undefined;
+  private storedSweep: Promise<void> | undefined;
+  private readonly stopStoredSweep = new AbortController();
 
   /**
    * @param ctx - host plugin context (agents registry, session events).
@@ -748,6 +836,10 @@ export class AutoContinueRunner {
     return { ...this.dayStats, byCode: { ...this.dayStats.byCode } };
   }
 
+  recentRecoveryAttempts(): RecoveryAttempt[] {
+    return this.recoveryAttempts.map(attempt => ({ ...attempt }));
+  }
+
   /** 对外(状态桥): 当前生效的会话级暂停列表。 */
   activePauses(): { sessionId: SessionId; until: number }[] {
     const now = Date.now();
@@ -778,6 +870,28 @@ export class AutoContinueRunner {
     for (const listener of this.stateListeners) listener();
   }
 
+  private sessionConfig(sessionId: SessionId): AutoContinueConfig {
+    const config = this.getConfig();
+    const mode = sessionMode(config.sessionModes, sessionId);
+    return {
+      ...config,
+      paused: config.paused || mode === 'off',
+      resumeCompletedTurns: mode === 'default' ? config.resumeCompletedTurns : mode === 'loop',
+      loopGuard: config.loopGuard && mode !== 'off',
+    };
+  }
+
+  configurationChanged(): void {
+    if (this.disposed) return;
+    for (const [sessionId, state] of this.states) {
+      const config = this.sessionConfig(sessionId);
+      if (config.paused || (isLoopReason(state.pendingReason ?? '') && !config.resumeCompletedTurns)) {
+        this.cancelPending(sessionId, '会话模式或全局设置已更改');
+      }
+    }
+    this.emitState();
+  }
+
   /** 对外(状态桥): 消费待展示的通知。 */
   drainNotices(): HostNotice[] {
     return this.notices.splice(0, this.notices.length);
@@ -800,6 +914,7 @@ export class AutoContinueRunner {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.stopStoredSweep.abort();
     if (this.bootScanTimer !== undefined) clearTimeout(this.bootScanTimer);
     this.bootScanTimer = undefined;
     this.wakeBootScan?.();
@@ -859,6 +974,9 @@ export class AutoContinueRunner {
       return;
     }
     if (sessionState?.subagent) return;
+    if (sessionState?.maintenanceTurn !== undefined &&
+        sessionState.maintenanceTurn === (event.data as { turn?: number }).turn &&
+        event.type !== 'turn/start' && event.type !== 'turn/end') return;
     if (
       (event.type === 'user/message' || event.type === 'assistant/message') &&
       typeof event.surfaceOp === 'object' &&
@@ -873,6 +991,9 @@ export class AutoContinueRunner {
       // 任何新鲜调用都代表进展（即使缺关联 id）；旧帧重放不能清短句 streak。
       if (state.tools.recordCall(event)) {
         state.shortRun = 0;
+        state.sameTextRun = 0;
+        state.lastAssistantText = '';
+        state.reasoningRepeatRun = 0;
         if (this.tracksOutput(state, event)) state.turnOutput = 'visible';
       }
     } else if (event.type === 'tool/result') {
@@ -894,7 +1015,10 @@ export class AutoContinueRunner {
       if (this.tracksOutput(state, event)) {
         const chunk = event.data.chunk;
         const visible = this.chunkIsVisible(chunk);
-        if (visible) state.turnOutput = 'visible';
+        if (visible) {
+          state.turnOutput = 'visible';
+          state.reasoningRepeatRun = 0;
+        }
         else if (state.turnOutput === 'empty' && chunk.type !== 'usage' && chunk.type !== 'finish') state.turnOutput = 'silent';
         if (visible) state.stepOutput = 'visible';
         else if (chunk.type === 'reasoning-delta' && state.stepOutput === 'none') state.stepOutput = 'reasoning';
@@ -926,7 +1050,7 @@ export class AutoContinueRunner {
       if (part === null || typeof part !== 'object') return true;
       const block = part as { type?: unknown; text?: unknown };
       if (block.type === 'reasoning') return false;
-      if (block.type === 'text') return typeof block.text !== 'string' || block.text.trim() !== '';
+      if (block.type === 'text') return typeof block.text !== 'string' || visibleText(block.text) !== '';
       return true;
     });
   }
@@ -954,14 +1078,14 @@ export class AutoContinueRunner {
 
   /** A chunk the user can see: visible text, a tool call, or a non-reasoning block. */
   private chunkIsVisible(chunk: AssistantChunk): boolean {
-    return (chunk.type === 'text-delta' && chunk.text.trim() !== '') ||
+    return (chunk.type === 'text-delta' && visibleText(chunk.text) !== '') ||
       chunk.type === 'tool-call-delta' ||
       (chunk.type === 'block-end' && this.hasVisibleContent([chunk.block])) ||
       (chunk.type === 'block-start' && chunk.blockType !== 'reasoning' && chunk.blockType !== 'text');
   }
 
   private normalizedSegment(text: string): string {
-    return text.replace(/\s+/g, ' ').trim();
+    return visibleText(text).replace(/\s+/g, ' ');
   }
 
   private isNearDuplicateSegment(left: string, right: string): boolean {
@@ -1091,7 +1215,7 @@ export class AutoContinueRunner {
     state: SessionState,
     modelChunk: AssistantChunk,
   ): void {
-    if (!this.getConfig().loopGuard || !state.running || state.loopFired) return;
+    if (!this.sessionConfig(sessionId).loopGuard || !state.running || state.loopFired) return;
     // kata ab45: a degenerate function-call argument stream emits an unending run of whitespace and
     // never closes its JSON. Whitespace-only deltas accumulate; any real content resets the run.
     if (modelChunk.type === 'tool-call-delta') {
@@ -1151,16 +1275,16 @@ export class AutoContinueRunner {
     state: SessionState,
     event: SessionEvent<'assistant/message'>,
   ): void {
-    if (!this.getConfig().loopGuard) return;
+    if (!this.sessionConfig(sessionId).loopGuard) return;
     const text = this.assistantText(event);
-    const trimmed = text.trim();
+    const trimmed = visibleText(text);
     // 相同文本重复(不限长度): 模型反复输出完全相同的消息是最强的循环信号,
     // 例如 "Let me test variants of the regex..." 连续 7 遍
     if (trimmed !== '' && trimmed === state.lastAssistantText) {
       state.sameTextRun += 1;
     } else {
       state.lastAssistantText = trimmed;
-      state.sameTextRun = 1;
+      state.sameTextRun = trimmed === '' ? 0 : 1;
     }
     // 短句计数(长度 < loopShortChars 且落在时间窗内): 空转信号
     if (trimmed.length < this.getConfig().loopShortChars) {
@@ -1179,7 +1303,29 @@ export class AutoContinueRunner {
     if (streamTail !== '') this.noteStreamSegment(sessionId, state, streamTail);
     state.streamLastSegment = '';
     state.streamRepeatRun = 0;
+    this.trackReasoningRepeat(state, event.data.message.content);
     this.checkLoop(sessionId, state);
+  }
+
+  /**
+   * Repeated reasoning-only messages, counted across turns. Visible output ends the run; a reasoning-only message
+   * extends it when its normalised reasoning equals the previous one, else starts a new run; a message with no
+   * content leaves the run unchanged.
+   */
+  private trackReasoningRepeat(state: SessionState, content: unknown): void {
+    const output = this.messageOutput(content);
+    if (output === 'none') return;
+    if (output === 'visible') {
+      state.reasoningRepeatRun = 0;
+      return;
+    }
+    const key = visibleText(reasoningText(content));
+    if (key !== '' && key === state.reasoningRepeatText) {
+      state.reasoningRepeatRun += 1;
+    } else {
+      state.reasoningRepeatText = key;
+      state.reasoningRepeatRun = key === '' ? 0 : 1;
+    }
   }
 
   /** 两个循环信号的公共检查; 命中且本回合未打断过则打断。 */
@@ -1188,12 +1334,15 @@ export class AutoContinueRunner {
     state: SessionState,
     toolRepeat?: ToolRepeatSignal,
   ): void {
-    if (!this.getConfig().loopGuard) return;
+    if (!this.sessionConfig(sessionId).loopGuard) return;
     if (state.loopFired) return;
     if (!state.running) return; // 只干预运行中的回合
     const config = this.getConfig();
     if (state.sameTextRun >= config.loopRepeatText) {
       this.log(`检测到空转循环 ${sessionId}: 连续 ${state.sameTextRun} 条相同消息`);
+      this.interruptLoop(sessionId, state);
+    } else if (state.reasoningRepeatRun >= config.loopRepeatText) {
+      this.log(`loop guard ${sessionId}: ${state.reasoningRepeatRun} identical reasoning-only messages in a row`);
       this.interruptLoop(sessionId, state);
     } else if (state.shortRun >= config.loopShortCount) {
       this.log(`检测到空转循环 ${sessionId}: 连续 ${state.shortRun} 条短句且无工具调用`);
@@ -1239,6 +1388,8 @@ export class AutoContinueRunner {
     switch (event.type) {
       case 'turn/start':
         state.running = true;
+        state.maintenanceTurn = isMaintenanceTurnStart(event) ? event.data.turn : undefined;
+        if (state.maintenanceTurn !== undefined) state.pendingRecoveryAt = 0;
         // 新回合开始: 清空上一步工具调用状态, 避免跨回合误用护栏
         state.tools.startTurn(event.seq);
         // loop guard 状态按回合重置
@@ -1282,6 +1433,12 @@ export class AutoContinueRunner {
         const lastReasoningUnits = state.reasoningOnlyUnits;
         state.stepOutput = 'none';
         state.reasoningOnlyUnits = 0;
+        const maintenance = state.maintenanceTurn !== undefined && state.maintenanceTurn === event.data.turn;
+        state.maintenanceTurn = undefined;
+        if (maintenance) {
+          this.log(`跳过维护回合 ${sessionId}(message-ops): 不触发自动继续`);
+          break;
+        }
         const reason = event.data.reason;
         const reasonKind = readReasonKind(reason);
         if (reasonKind === undefined) {
@@ -1296,7 +1453,7 @@ export class AutoContinueRunner {
           state.lastTurn = event.data.turn;
           state.lastFailureAt = Date.now();
           this.noteRecovery(sessionId, 'error');
-          const config = this.getConfig();
+          const config = this.sessionConfig(sessionId);
           if ((config.resumeSilentTurns || config.resumeCompletedTurns) && spiralTripped) {
             // 复读信号: 本回合推理内句子高度重复, 且之后没有可见输出。强制续跑一次, 带循环文本。
             // 同一复读事件只升级一次 (spiralEscalated 是防复读上限); 之后仍无可见输出则停止, 并通知用户 (config.notify)。
@@ -1321,7 +1478,7 @@ export class AutoContinueRunner {
           // 自主循环的例外只在于「是否续跑」, 不在于「是否清零预算」: 循环对每个
           // completed 回合都强制续跑, 但失败预算依旧只在可见输出时清零, 否则
           // 空回合/未观察到的回合会不断抹掉连续计数, 令连续上限永远无法生效。
-          if (this.getConfig().resumeCompletedTurns) {
+          if (this.sessionConfig(sessionId).resumeCompletedTurns) {
             if (turnOutput === 'visible') {
               state.consecutive = 0;
               state.lastFailure = undefined;
@@ -1335,6 +1492,7 @@ export class AutoContinueRunner {
           }
         } else if (reasonKind === 'aborted') {
           if (isLoopGuardCancelReason((reason as { reason?: unknown }).reason)) {
+            if (this.sessionConfig(sessionId).paused) break;
             // 我们自己的 loop guard 打断: 视为可恢复中断, 用循环提示文本重启回合。
             // 不清 consecutive / lastAttemptAt: 冷却与连续上限在 loop 路径同样生效,
             // 防止无限打断重发(issue #13); 打断本身受冷却约束, 重启也要等冷却。
@@ -1344,6 +1502,7 @@ export class AutoContinueRunner {
             state.lastShortAt = 0;
             state.lastAssistantText = '';
             state.sameTextRun = 0;
+            state.reasoningRepeatRun = 0;
             state.streamTail = '';
             state.streamLastSegment = '';
             state.streamRepeatRun = 0;
@@ -1424,6 +1583,7 @@ export class AutoContinueRunner {
 
   private onTurnFailure(sessionId: SessionId, reason: string, failure: FailureFacts): void {
     const config = this.getConfig();
+    if (sessionMode(config.sessionModes, sessionId) === 'off') return;
     if (config.classify && !isTransientFailure(failure, config.retryableErrorPatterns)) {
       const copy = NOTICE_COPY[config.locale];
       const summary = `${failure.code}${failure.status !== undefined ? ` (HTTP ${failure.status})` : ''}`;
@@ -1551,13 +1711,14 @@ export class AutoContinueRunner {
   /** 通知操作按钮与回调(「立即续跑」/「暂停该会话 1 小时」)。 */
   private notifyOptions(sessionId: SessionId, locale: AutoContinueLocale): NotifyOptions {
     const copy = NOTICE_COPY[locale];
-    return {
-      actions: [
+    // 未物化的存储会话没有 live agent, 「立即续跑」只会空转; 只保留暂停。
+    const actions: NotifyAction[] = this.ctx.agents.get(sessionId) === undefined
+      ? [{ action: 'pause1h', title: copy.pauseAction }]
+      : [
         { action: 'resume', title: copy.resumeAction },
         { action: 'pause1h', title: copy.pauseAction },
-      ],
-      onAction: (action) => this.onNotifyAction(sessionId, action),
-    };
+      ];
+    return { actions, onAction: (action) => this.onNotifyAction(sessionId, action) };
   }
 
   private onNotifyAction(sessionId: SessionId, action: string): void {
@@ -1668,10 +1829,11 @@ export class AutoContinueRunner {
 
   private scheduleAttempt(sessionId: SessionId, reason: string, force = false): boolean {
     const state = this.state(sessionId);
-    const config = this.getConfig();
+    const config = this.sessionConfig(sessionId);
+    if (isLoopReason(reason) && !config.resumeCompletedTurns) return false;
     if (this.isSubagent(sessionId, state)) return false; // 子代理会话由父代理处理, 不抢跑
     if (config.paused) {
-      this.log(`跳过 ${sessionId}(${reason}): 全局暂停中`);
+      this.log(`跳过 ${sessionId}(${reason}): 自动继续已暂停`);
       return false;
     }
     if (Date.now() < (this.pauseUntil.get(sessionId) ?? 0)) {
@@ -1699,6 +1861,7 @@ export class AutoContinueRunner {
     const timer = setTimeout(() => {
       if (state.pendingTimer !== timer) return;
       state.pendingTimer = undefined;
+      state.pendingReason = undefined;
       // 保险丝: 定时器回调内任何异常(含 inactive context)都不得成为未捕获异常炸掉进程。
       try {
         void this.fire(sessionId, reason, force);
@@ -1707,6 +1870,7 @@ export class AutoContinueRunner {
       }
     }, config.graceMs);
     state.pendingTimer = timer;
+    state.pendingReason = reason;
     const template = this.templateFor(config, reason);
     this.log(
       `检测到非人为中断 ${sessionId}(${reason}), ${config.graceMs}ms 后自动发送「${template}」`,
@@ -1721,8 +1885,10 @@ export class AutoContinueRunner {
   private deferCooldownRetry(sessionId: SessionId, reason: string, remaining: number): void {
     const state = this.state(sessionId);
     if (state.cooldownRetryTimer !== undefined) clearTimeout(state.cooldownRetryTimer);
+    state.pendingReason = reason;
     state.cooldownRetryTimer = setTimeout(() => {
       state.cooldownRetryTimer = undefined;
+      state.pendingReason = undefined;
       try {
         this.schedule(sessionId, reason);
       } catch (error) {
@@ -1739,11 +1905,13 @@ export class AutoContinueRunner {
     if (isLoopReason(reason)) return config.continueTextLoop;
     if (reason.endsWith(':silent')) return config.continueTextSilent;
     if (reason.includes('max-tokens')) return config.continueTextMaxTokens;
+    if (reason.includes('interrupted')) return config.continueTextInterrupted;
     return config.continueText;
   }
 
   private cancelPending(sessionId: SessionId, why: string): void {
     const state = this.state(sessionId);
+    state.pendingReason = undefined;
     let cancelled = false;
     if (state.pendingTimer !== undefined) {
       clearTimeout(state.pendingTimer);
@@ -1756,13 +1924,18 @@ export class AutoContinueRunner {
       state.cooldownRetryTimer = undefined;
       cancelled = true;
     }
+    if (state.loopRetryTimer !== undefined) {
+      clearTimeout(state.loopRetryTimer);
+      state.loopRetryTimer = undefined;
+      cancelled = true;
+    }
     if (cancelled) this.log(`取消 ${sessionId} 的自动继续(${why})`);
   }
 
   private fire(sessionId: SessionId, reason: string, force = false): void {
     if (this.disposed) return;
     const state = this.state(sessionId);
-    const config = this.getConfig();
+    const config = this.sessionConfig(sessionId);
     const manualResume = force && reason === MANUAL_NOTIFICATION_REASON;
     if (reason.endsWith(':silent') && !config.resumeSilentTurns) return;
     // 宽限期内循环被关闭: 发送前必须重新检查开关, 与 :silent 恢复同样处理。
@@ -1770,7 +1943,7 @@ export class AutoContinueRunner {
     if (isLoopReason(reason) && !config.resumeCompletedTurns) return;
     if (this.isSubagent(sessionId, state)) return; // 子代理会话由父代理处理, 不抢跑
     if (config.paused && !manualResume) {
-      this.log(`跳过 ${sessionId}(${reason}): 全局暂停中`);
+      this.log(`跳过 ${sessionId}(${reason}): 自动继续已暂停`);
       return;
     }
     if (!manualResume && Date.now() < (this.pauseUntil.get(sessionId) ?? 0)) {
@@ -1819,6 +1992,17 @@ export class AutoContinueRunner {
       // 自主循环的成功续跑不计入连续上限: 上限只约束失败(网络中断等)。
       if (reason !== LOOP_COMPLETED_REASON) state.consecutive += 1;
       state.pendingRecoveryAt = now; // 等待窗口内的下一个回合结束来判定恢复结果
+      if (reason !== LOOP_COMPLETED_REASON) {
+        this.recoveryAttempts.unshift({
+          sessionId, at: now, consecutive: state.consecutive,
+          reason: manualResume ? 'manual'
+            : reason === 'loop:aborted' ? 'loop-guard'
+            : reason.endsWith(':silent') || reason === LOOP_SILENT_REASON ? 'silent'
+            : reason.endsWith(':interrupted') ? 'interrupted'
+            : reason.endsWith(':max-tokens') ? 'max-tokens' : 'error',
+        });
+        this.recoveryAttempts.length = Math.min(this.recoveryAttempts.length, 20);
+      }
       this.bumpStat({ sent: 1, ...(state.lastFailure !== undefined ? { code: state.lastFailure.code } : {}) });
       this.log(`已自动发送「${text}」到 ${sessionId}(${reason}), 第 ${state.consecutive} 次连续`);
       if (config.notify) {
@@ -1895,6 +2079,14 @@ export class AutoContinueRunner {
       if (attempt > 0 && Date.now() >= deadline) return;
       try {
         if (await this.scanInterrupted()) return;
+        const config = this.getConfig();
+        if (!config.paused && config.scanOnBoot && this.storedSweep === undefined) {
+          this.storedSweep = this.sweepStoredSessions(config, deadline)
+            .catch(error => {
+              if (!this.disposed) this.ctx.logger.error(`Stored session scan failed: ${String(error)}`);
+            })
+            .finally(() => { this.storedSweep = undefined; });
+        }
       } catch (error) {
         if (this.disposed) return;
         // 宿主未就绪时每 3s 重试; 只节流记录日志, 避免刷屏。
@@ -1909,12 +2101,13 @@ export class AutoContinueRunner {
       const remaining = deadline - Date.now();
       if (this.disposed || remaining <= 0) return;
       await new Promise<void>((resolve) => {
-        this.wakeBootScan = resolve;
-        this.bootScanTimer = setTimeout(() => {
+        this.wakeBootScan = () => {
+          if (this.bootScanTimer !== undefined) clearTimeout(this.bootScanTimer);
           this.bootScanTimer = undefined;
           this.wakeBootScan = undefined;
           resolve();
-        }, Math.min(3000, remaining));
+        };
+        this.bootScanTimer = setTimeout(this.wakeBootScan, Math.min(3000, remaining));
       });
     }
   }
@@ -1978,10 +2171,14 @@ export class AutoContinueRunner {
     const archived = new Set(registry.archivedSessionIds);
     const now = Date.now();
     const queue: PersistedEntry[] = [];
+    // The stored sweep (sweepStoredSessions) materializes root sessions whenever sessionQuery exists, so the loader
+    // resumes roots only on hosts without it. Children are always the loader's (continueChild), so one path per session.
+    const sweepOwnsRoots = this.ctx.get('sessionQuery') !== undefined;
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
       if (header.cwd === undefined) continue;
+      if (sweepOwnsRoots && header.origin !== 'subagent') continue;
       const entry = await this.readPersistedEntry(persistence, header, now, config);
       if (entry !== undefined) queue.push(entry);
     }
@@ -2474,6 +2671,7 @@ export class AutoContinueRunner {
     const now = Date.now();
     const candidates: {
       session: Session;
+      sessionId: SessionId;
       events: readonly SessionEvent[];
       lastEnd: SessionEvent<'turn/end'>;
       reasonKind: string;
@@ -2482,102 +2680,319 @@ export class AutoContinueRunner {
       listIndex: number;
     }[] = [];
     for (const agent of this.ctx.agents.list()) {
-      const session = agent.session;
-      // A subagent child is never loader-resumed (continueChild delivers it through the host), so the live scan skips every subagent.
-      if (session.header.origin === 'subagent' || this.bootScannedSessions.has(session)) {
-        continue;
-      }
-      const state = this.state(session.id);
-      if (state.pendingTimer !== undefined || state.consecutive >= config.maxConsecutive) continue;
-      if (now - state.lastAttemptAt < this.cooldownFor(state)) continue;
-      if (now < (this.pauseUntil.get(session.id) ?? 0)) continue;
-      const events = snapshotSessionEvents(session);
-      // A published session may still be waiting for its first history snapshot.
-      if (events.length === 0) continue;
-      let lastEnd: SessionEvent<'turn/end'> | undefined;
-      for (let i = events.length - 1; i >= 0; i -= 1) {
-        const event = events[i];
-        if (event?.type === 'turn/end') { lastEnd = event; break; }
-      }
-      const reasonKind = readReasonKind(lastEnd?.data.reason);
-      const silent = reasonKind === 'no-visible-output' && config.resumeSilentTurns;
-      const superseded = lastEnd !== undefined && events.some((event) =>
-        event.seq > lastEnd!.seq && (event.type === 'turn/start' ||
-          (event.type === 'user/message' && event.data.source.kind === 'user')),
-      );
-      if (lastEnd === undefined || reasonKind === undefined || (!isInterruptedTurnEnd(lastEnd.data.reason) && !silent) ||
-          lastEnd.time < now - config.freshMs || superseded) {
-        this.bootScannedSessions.add(session);
-        continue;
-      }
-      // Round 4 (vrpe F-A1, M1, M1b, O2): the boot scan and the 3-second poll share this filter, and it reads the
-      // persisted spiral signal instead of the last step being reasoning. Without the signal the turn is ordinary: it
-      // falls through to the candidate list and is continued with the max-tokens text. With the signal it gets one
-      // forced resume carrying config.loopText, or the stop notice when the episode already escalated before the
-      // restart (the escalation is read from the log, see this.persistedSpiralEscalated). The persisted read honours
-      // config.loopGuard exactly as the live detector does (round 5, reviewer F2), so both are passed to it.
-      if (reasonKind === 'max-tokens' && this.messageOutput(lastTurnMessageContent(events, lastEnd)) === 'reasoning' &&
-          persistedSpiralTripped(events, lastEnd, config.loopGuard)) {
-        this.bootScannedSessions.add(session);
-        if (this.persistedSpiralEscalated(events, lastEnd, config)) {
-          this.log(`停止 ${session.id}(scan:turn/end:max-tokens): 推理复读, 强制续跑一次后仍无可见输出, 需要人工介入`);
-          this.notifySpiralStopped(session.id, config);
-        } else if (this.schedule(session.id, LOOP_SPIRAL_REASON, true)) {
-          // Round 5 (reviewer F1): the bound is not set here. fire() sets it when the forced resume is delivered, so a
-          // refused or cancelled scan escalation leaves the episode free for the next attempt.
-          this.log(`升级 ${session.id}(scan:turn/end:max-tokens): 推理复读, 强制续跑一次 (${LOOP_SPIRAL_REASON})`);
+      let session: Session | undefined;
+      let sessionId: SessionId | undefined;
+      try {
+        session = agent.session;
+        // Check quarantine before reading metadata that may have failed previously. A subagent child is never
+        // loader-resumed (continueChild delivers it through the host), so the live scan skips every subagent.
+        if (this.bootScannedSessions.has(session) || session.header?.origin === 'subagent') continue;
+        sessionId = session.id;
+        if (typeof sessionId !== 'string' || sessionId === '') throw new TypeError('session id is unavailable');
+        if (this.sessionConfig(sessionId).paused) continue;
+        const state = this.state(sessionId);
+        if (state.pendingTimer !== undefined || state.consecutive >= config.maxConsecutive) continue;
+        if (now - state.lastAttemptAt < this.cooldownFor(state)) continue;
+        if (now < (this.pauseUntil.get(sessionId) ?? 0)) continue;
+        const events = snapshotSessionEvents(session);
+        // An empty, valid snapshot may still be waiting for history hydration.
+        if (events.length === 0) continue;
+        let lastEnd: SessionEvent<'turn/end'> | undefined;
+        for (let i = events.length - 1; i >= 0; i -= 1) {
+          const event = events[i];
+          if (event?.type === 'turn/end') { lastEnd = event; break; }
         }
-        continue;
-      }
-      let failure: FailureFacts | undefined;
-      if (reasonKind === 'error') {
-        failure = parseFailureFacts((lastEnd.data.reason as { error?: unknown }).error);
-        if (failure === undefined) {
+        const reasonKind = readReasonKind(lastEnd?.data.reason);
+        const lastStart = latestTurnStart(events);
+        const maintenance = lastStart?.data.turn === lastEnd?.data.turn && isMaintenanceTurnStart(lastStart);
+        const silent = reasonKind === 'no-visible-output' && config.resumeSilentTurns;
+        const superseded = lastEnd !== undefined && events.some((event) =>
+          event.seq > lastEnd!.seq && (event.type === 'turn/start' ||
+            (event.type === 'user/message' && event.data.source.kind === 'user')),
+        );
+        if (lastEnd === undefined || maintenance || reasonKind === undefined || (!isInterruptedTurnEnd(lastEnd.data.reason) && !silent) ||
+            lastEnd.time < now - config.freshMs || superseded) {
           this.bootScannedSessions.add(session);
-          console.error(`[auto-continue] 忽略畸形扫描 turn/end ${session.id}: error details 无法解释`);
           continue;
         }
-        if (config.classify && !isTransientFailure(failure, config.retryableErrorPatterns)) {
+        // Round 4 (vrpe F-A1, M1, M1b, O2): the boot scan and the 3-second poll share this filter, and it reads the
+        // persisted spiral signal instead of the last step being reasoning. Without the signal the turn is ordinary: it
+        // falls through to the candidate list and is continued with the max-tokens text. With the signal it gets one
+        // forced resume carrying config.loopText, or the stop notice when the episode already escalated before the
+        // restart (the escalation is read from the log, see this.persistedSpiralEscalated). The persisted read honours
+        // config.loopGuard exactly as the live detector does (round 5, reviewer F2), so both are passed to it.
+        if (reasonKind === 'max-tokens' && this.messageOutput(lastTurnMessageContent(events, lastEnd)) === 'reasoning' &&
+            persistedSpiralTripped(events, lastEnd, config.loopGuard)) {
           this.bootScannedSessions.add(session);
-          this.onTurnFailure(session.id, 'scan:turn/end:error', failure);
+          if (this.persistedSpiralEscalated(events, lastEnd, config)) {
+            this.log(`停止 ${sessionId}(scan:turn/end:max-tokens): 推理复读, 强制续跑一次后仍无可见输出, 需要人工介入`);
+            this.notifySpiralStopped(sessionId, config);
+          } else if (this.schedule(sessionId, LOOP_SPIRAL_REASON, true)) {
+            // Round 5 (reviewer F1): the bound is not set here. fire() sets it when the forced resume is delivered, so a
+            // refused or cancelled scan escalation leaves the episode free for the next attempt.
+            this.log(`升级 ${sessionId}(scan:turn/end:max-tokens): 推理复读, 强制续跑一次 (${LOOP_SPIRAL_REASON})`);
+          }
           continue;
         }
+        let failure: FailureFacts | undefined;
+        if (reasonKind === 'error') {
+          failure = parseFailureFacts((lastEnd.data.reason as { error?: unknown }).error);
+          if (failure === undefined) {
+            this.bootScannedSessions.add(session);
+            console.error(`[auto-continue] 忽略畸形扫描 turn/end ${sessionId}: error details 无法解释`);
+            continue;
+          }
+          if (config.classify && !isTransientFailure(failure, config.retryableErrorPatterns)) {
+            this.bootScannedSessions.add(session);
+            this.onTurnFailure(sessionId, 'scan:turn/end:error', failure);
+            continue;
+          }
+        }
+        candidates.push({
+          session, sessionId, events, lastEnd, reasonKind, failure,
+          lastActivityAt: events.reduce((latest, event) => Math.max(latest, event.time), 0),
+          listIndex: candidates.length,
+        });
+      } catch (error) {
+        if (session !== null && typeof session === 'object') this.bootScannedSessions.add(session);
+        const identity = session ?? agent;
+        if (identity !== null && typeof identity === 'object') {
+          if (this.bootScanErrors.has(identity)) continue;
+          this.bootScanErrors.add(identity);
+        }
+        this.logBootScanFailure(sessionId, error);
       }
-      candidates.push({
-        session, events, lastEnd, reasonKind, failure,
-        lastActivityAt: events.reduce((latest, event) => Math.max(latest, event.time), 0),
-        listIndex: candidates.length,
-      });
     }
     // Limit recoveries, not healthy/permanent histories that cannot be resumed.
     candidates.sort((left, right) => right.lastActivityAt - left.lastActivityAt || left.listIndex - right.listIndex);
-    // Live candidates keep the whole scanLimit budget, as with no loader-resumed sessions. Loader-resumed sessions
-    // get only the slots left over, so one pass still starts at most scanLimit recoveries.
-    const live = candidates.filter((candidate) => !this.persistedLoaded.has(candidate.session.id)).slice(0, config.scanLimit);
+    // Live candidates are tried first and keep the whole scanLimit budget; loader-resumed sessions get only the slots
+    // left over, so one pass still starts at most scanLimit recoveries. A candidate whose preparation throws takes no slot.
+    const live = candidates.filter((candidate) => !this.persistedLoaded.has(candidate.session.id));
     const loaded = candidates.filter((candidate) => this.persistedLoaded.has(candidate.session.id));
-    for (const candidate of [...live, ...loaded.slice(0, config.scanLimit - live.length)]) {
+    let recoveries = 0;
+    for (const candidate of [...live, ...loaded]) {
+      if (recoveries >= config.scanLimit) break;
       if (this.disposed) return true;
-      const { session, events, lastEnd, reasonKind, failure } = candidate;
+      const { session, sessionId, events, lastEnd, reasonKind, failure } = candidate;
       this.bootScannedSessions.add(session);
-      const state = this.state(session.id);
-      this.applyGuardFromEvents(state, events, lastEnd.seq);
-      const scanReason = `scan:turn/end:${reasonKind}${reasonKind === 'no-visible-output' ? ':silent' : ''}`;
-      this.log(`扫描发现中断 ${session.id}(turn/end:${reasonKind}), 交给恢复策略处理`);
-      if (failure !== undefined) {
-        state.lastFailure = failure;
-        state.lastTurn = lastEnd.data.turn;
-        state.lastFailureAt = lastEnd.time;
-        this.onTurnFailure(session.id, scanReason, failure);
-      } else {
-        if (reasonKind === 'no-visible-output') {
-          state.lastFailure = undefined;
+      const state = this.state(sessionId);
+      try {
+        this.applyGuardFromEvents(state, events, lastEnd.seq);
+        const scanReason = `scan:turn/end:${reasonKind}${reasonKind === 'no-visible-output' ? ':silent' : ''}`;
+        this.log(`扫描发现中断 ${sessionId}(turn/end:${reasonKind}), 交给恢复策略处理`);
+        if (failure !== undefined) {
+          state.lastFailure = failure;
           state.lastTurn = lastEnd.data.turn;
           state.lastFailureAt = lastEnd.time;
+          this.onTurnFailure(sessionId, scanReason, failure);
+        } else {
+          if (reasonKind === 'no-visible-output') state.lastFailure = undefined;
+          // 没有失败事实的恢复(如 interrupted)也要填 {turn}/{elapsed}, README 对所有继续文本承诺这些占位符。
+          state.lastTurn = lastEnd.data.turn;
+          state.lastFailureAt = lastEnd.time;
+          this.schedule(sessionId, scanReason);
         }
-        this.schedule(session.id, scanReason);
+        recoveries += 1;
+      } catch (error) {
+        state.tools.reset();
+        this.cancelPending(sessionId, '启动扫描失败');
+        this.logBootScanFailure(sessionId, error);
       }
     }
     return false;
+  }
+
+  /** Bound cold reads even if a backend ignores cancellation; release late leases. */
+  private async readStored<T extends object>(read: (signal: AbortSignal) => Promise<T>, deadline: number): Promise<T> {
+    const timeout = new AbortController();
+    const signal = AbortSignal.any([this.stopStoredSweep.signal, timeout.signal]);
+    const timer = setTimeout(() => timeout.abort(new Error('Stored session read timed out')), Math.max(0, Math.min(STORED_READ_TIMEOUT_MS, deadline - Date.now())));
+    let onAbort: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+    const pending = Promise.resolve().then(() => { signal.throwIfAborted(); return read(signal); });
+    void pending.then(value => {
+      if (signal.aborted) (value as { [Symbol.dispose]?: () => void })[Symbol.dispose]?.();
+    }).catch(() => {});
+    try {
+      return await Promise.race([pending, cancelled]);
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort!);
+    }
+  }
+
+  /**
+   * 存储扫描: 枚举持久化会话, 把尾部命中恢复谓词的未加载会话物化为
+   * live agent。宿主重启后 agent 仅在客户端打开会话时才懒加载, 不物化
+   * 则启动扫描永远看不到它们; 谓词与上方扫描一致, 仅失败类原因。
+   */
+  private async sweepStoredSessions(config: AutoContinueConfig, deadline: number): Promise<void> {
+    const query = this.ctx.get('sessionQuery');
+    if (query === undefined) return;
+    const records = await this.readStored(signal => query.listSessions(signal), deadline);
+    if (!Array.isArray(records)) throw new TypeError('stored session listing is not an array');
+    if (!this.storedSweepAnnounced) {
+      this.storedSweepAnnounced = true;
+      this.ctx.logger.info(`存储扫描就绪: ${records.length} 个会话记录`);
+    }
+    let observed = 0;
+    for (const record of records) {
+      if (this.disposed || Date.now() >= deadline || this.getConfig().paused || !this.getConfig().scanOnBoot) return;
+      if (typeof record?.header?.id !== 'string' || record.header.id === '') {
+        this.logBootScanFailure(undefined, new TypeError('stored session record has no id'));
+        continue;
+      }
+      const sessionId = record.header.id;
+      if (this.sessionConfig(sessionId).paused || Date.now() < (this.pauseUntil.get(sessionId) ?? 0)) continue;
+      if (record.live || this.storedSwept.has(sessionId)) continue;
+      this.storedSwept.add(sessionId);
+      if (record.header.origin === 'subagent') continue;
+      observed += 1;
+      let observation: StoredObservation | undefined;
+      try {
+        const stored: StoredObservation = await this.readStored(signal => query.observeSession(sessionId, { projectionMode: 'all', signal }), deadline);
+        observation = stored;
+        if (this.disposed) return;
+        if (this.sessionConfig(sessionId).paused) {
+          this.storedSwept.delete(sessionId);
+          continue;
+        }
+        const events = validateSessionEvents(stored.events);
+        if (events.length === 0) continue;
+        // 快照之后客户端可能已打开该会话: 归还 live 扫描, 避免与 live 路径
+        // 重复上报, 也避免物化撞上写归属。
+        if (this.ctx.agents.get(sessionId) !== undefined) continue;
+        let lastEnd: SessionEvent<'turn/end'> | undefined;
+        for (let i = events.length - 1; i >= 0; i -= 1) {
+          const event = events[i];
+          if (event?.type === 'turn/end') { lastEnd = event; break; }
+        }
+        const lastStart = latestTurnStart(events);
+        // 兜底分支: 真实 sessionQuery 冷读会把内存中的 interruptedTurnClosers
+        // 折叠进返回日志(尾部即合成 turn/end), 上方 closed-tail 才是生产主路
+        // 径。这里覆盖两种例外——不折叠的宿主实现, 以及 listSessions 快照与
+        // observeSession 之间客户端刚打开、切在轮次中间的 live 视图。
+        const openTurn = lastStart !== undefined && (lastEnd === undefined || lastStart.seq > lastEnd.seq);
+        if (isMaintenanceTurnStart(lastStart) && (openTurn || lastStart?.data.turn === lastEnd?.data.turn)) continue;
+        let reasonKind: string | undefined;
+        let freshAt: number;
+        if (openTurn) {
+          reasonKind = 'interrupted';
+          freshAt = events[events.length - 1]?.time ?? 0;
+        } else {
+          reasonKind = readReasonKind(lastEnd?.data.reason);
+          freshAt = lastEnd?.time ?? 0;
+        }
+        // 过期或被取代的永久错误与 live 扫描一致地静默跳过, 不再单独上报。
+        if (reasonKind === undefined || freshAt < Date.now() - config.freshMs) continue;
+        if (reasonKind !== undefined && !openTurn) {
+          const silent = reasonKind === 'no-visible-output' && config.resumeSilentTurns;
+          // 尾随 turn/start 已按 openTurn 处理, 这里只剩用户接管一种取代形态。
+          const superseded = events.some((event) =>
+            lastEnd !== undefined && event.seq > lastEnd.seq && event.type === 'user/message' && event.data.source.kind === 'user',
+          );
+          // Same predicate as the live scan: a graceful-shutdown abort (aborted with cause disposed) is continued too.
+          if ((!isInterruptedTurnEnd(lastEnd?.data.reason) && !silent) || superseded) continue;
+          // 镜像 live 扫描的裁决: 畸形/永久错误不值得物化——物化后同样会被拦下。
+          if (reasonKind === 'error') {
+            const failure = parseFailureFacts((lastEnd!.data.reason as { error?: unknown }).error);
+            if (failure === undefined) {
+              console.error(`[auto-continue] 忽略畸形存储 turn/end ${sessionId}: error details 无法解释`);
+              continue;
+            }
+            // 永久错误同样走 onTurnFailure, 镜像 live 路径的统计与通知旁效。
+            if (config.classify && !isTransientFailure(failure, config.retryableErrorPatterns)) {
+              this.onTurnFailure(sessionId, 'sweep:turn/end:error', failure);
+              continue;
+            }
+          }
+        }
+        const presetId = stored.projections?.values.agentPreset ?? stored.header.agentPreset;
+        const loggedConfig = foldRequestHeader(events)?.config;
+        if (!await this.materializeStored(
+          sessionId,
+          presetId,
+          loggedConfig === undefined ? undefined : { provider: loggedConfig.provider, model: loggedConfig.model },
+        )) {
+          this.storedSwept.delete(sessionId);
+          return;
+        }
+        this.storedSweepFailures.delete(sessionId);
+        this.wakeBootScan?.();
+        this.ctx.logger.info(openTurn
+          ? `扫描物化存储会话 ${sessionId}(日志止于 turn/start, 视作 interrupted), 交给启动扫描接管`
+          : `扫描物化存储会话 ${sessionId}(turn/end:${reasonKind}), 交给启动扫描接管`);
+      } catch (error) {
+        if (this.disposed) return;
+        // 观察或物化失败允许下一轮重试; 连续触达上限后放弃, 并清掉计数——
+        // 已永久跳过的会话不再进入该映射, 不给长存活宿主留死重。
+        const failures = (this.storedSweepFailures.get(sessionId) ?? 0) + 1;
+        if (failures < SWEEP_MAX_FAILURES) {
+          this.storedSweepFailures.set(sessionId, failures);
+          this.storedSwept.delete(sessionId);
+        } else {
+          this.storedSweepFailures.delete(sessionId);
+        }
+        this.ctx.logger.error(`存储会话 ${sessionId} 物化失败: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        observation?.[Symbol.dispose]?.();
+        if (observed % SWEEP_OBSERVE_BATCH === 0 && !this.disposed) {
+          await new Promise<void>(resolve => setTimeout(resolve, 0));
+        }
+      }
+    }
+  }
+
+  /**
+   * 按会话记录的 preset 组合把存储会话恢复为 live agent(镜像会话控制
+   * 器的 adopt 路径: preset 挂载 + 会话已记录的模型选择回装)。模型选择
+   * 以日志记录的 request-header 播种 agentOptions——{{model}}/{{provider}}
+   * 提示变量与首次请求路由都读它, 驱动器还会因路由吻合而自行回装日志
+   * 记录的 effort; 无落点(从未发过请求的会话)回落宿主默认。恢复时追
+   * 加的合成 turn/end(`interrupted`)随后由常规扫描按既有关卡恢复。
+   */
+  private async materializeStored(
+    sessionId: SessionId,
+    presetId: string | undefined,
+    logged: { provider: string; model: string } | undefined,
+  ): Promise<boolean> {
+    if (this.disposed || this.sessionConfig(sessionId).paused || !this.getConfig().scanOnBoot) return false;
+    const presets = this.ctx.get('agentPresets');
+    // Mirrors session-controller's adopt: without agent options the agent has no
+    // provider/model, so prompt variables like {{model}} have no value and the
+    // request carries no route.
+    const defaultModel = this.ctx.get('agentDefaultModel');
+    const selection = defaultModel?.currentSelection();
+    const agentOptions = logged !== undefined
+      ? { provider: logged.provider, model: logged.model }
+      : selection === undefined ? undefined : { provider: selection.provider, model: selection.model };
+    if (presets === undefined) {
+      await this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, signal: this.stopStoredSweep.signal });
+      return true;
+    }
+    const resolvedId = (await presets.resolve(presetId)).id;
+    if (this.disposed || this.sessionConfig(sessionId).paused || !this.getConfig().scanOnBoot) return false;
+    if (this.ctx.agents.get(sessionId) !== undefined) return true;
+    await this.ctx.agents.resume({
+      resumeSessionId: sessionId,
+      agentOptions,
+      signal: this.stopStoredSweep.signal,
+      setup: async (agentCtx) => {
+        await presets.mount(agentCtx, resolvedId);
+      },
+    });
+    return true;
+  }
+
+  /** Captured identity only: even session.id can throw when the header is damaged. */
+  private logBootScanFailure(sessionId: SessionId | undefined, error: unknown): void {
+    console.error(`[auto-continue] 启动扫描跳过会话 ${sessionId ?? '(id unavailable)'}: ${
+      error instanceof Error ? error.message : String(error)
+    }`);
   }
 
   /** 从历史事件恢复上一步工具调用状态(扫描路径的幂等护栏)。 */

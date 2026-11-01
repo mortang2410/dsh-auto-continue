@@ -195,11 +195,10 @@ try {
     const agent = e.agent('scan-escalated');
     e.start();
     const bridge = e.bridge();
-    agent.session.events.push(
-      turnStart(1), storedUser(`${LOOP_PROBE} ${GUARD_SUFFIX}`),
-      assistantMessage(1, [{ type: 'reasoning', text: SPIRAL_SENTENCE.repeat(400) }]),
-      turnEnd(1, 'max-tokens'),
-    );
+    agent.session.events.push(...log([
+      storedStart(1), storedUser(`${LOOP_PROBE} ${GUARD_SUFFIX}`),
+      storedReasoning(1, SPIRAL_SENTENCE.repeat(400)), storedEnd(1, { kind: 'max-tokens' }),
+    ]));
     await flush();
     await pass();
     assert.equal(agent.followups.length, 0, 'an episode already escalated before the restart is not sent again');

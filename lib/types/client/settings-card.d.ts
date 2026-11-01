@@ -18,6 +18,7 @@ export interface AutoContinueSettingsCardState extends CardShell {
     resumeCompletedTurns: CardFieldState;
     continueTextLoop: CardFieldState;
     continueTextSilent: CardFieldState;
+    continueTextInterrupted: CardFieldState;
     guardTools: CardFieldState;
     guardPendingText: CardFieldState;
     guardDoneText: CardFieldState;
@@ -55,8 +56,9 @@ export declare class AutoContinueSettingsCardController {
     private readonly form;
     private readonly store;
     private readonly composer;
-    private composerSaving;
-    private composerFailed;
+    private readonly composerSaving;
+    private readonly composerFailed;
+    private readonly stopComposer;
     private disposed;
     private saveSequence;
     private notificationFeedback;
@@ -71,9 +73,9 @@ export declare class AutoContinueSettingsCardController {
      */
     inject(): AutoContinueSettingsCardFace;
     private save;
-    injectComposer(): ComposerToggleFace;
+    injectComposer(sessionId: string): ComposerToggleFace;
     private composerProjection;
-    private setEnabled;
+    private setMode;
     /** Release this card's subscription to the provider-owned settings form. */
     dispose(): void;
 }
@@ -81,5 +83,5 @@ export declare class AutoContinueSettingsCardController {
 export type AutoContinueSettingsCardProps = PropsLocale<'auto-continue'> & InjectFace<AutoContinueSettingsCardFace>;
 /** The bundle page supplies no list container, unlike the legacy settings slot. */
 export declare function AutoContinueSettingsPage(props: AutoContinueSettingsCardProps): import("react").JSX.Element;
-/** Native category layout, with the selected B3 repository invitation beside the introduction. */
+/** Native category layout; the plugin manager above already owns the title, version and status. */
 export declare function AutoContinueSettingsCard(props: AutoContinueSettingsCardProps): import("react").JSX.Element | null;

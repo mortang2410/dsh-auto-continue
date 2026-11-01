@@ -4,13 +4,15 @@
  * Since 0.8.0 the auto-continue ENGINE runs inside the host process (single
  * instance — see src/host/engine.ts), so this half only:
  * - registers the `auto-continue` settings card in the available plugin UI,
- * - adds a native composer switch backed by the same global pause setting,
+ * - adds a per-session composer switch and mode menu backed by host settings,
  * - subscribes to the host status bridge (SSE) and shows browser
  *   notifications with action buttons (Resume now / Pause 1h) via the bridge
  *   action endpoint,
  * - feeds the card's stats / paused-sessions panels from the bridge state.
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis';
+// Type-only: the slot service is declared by the renderer in newer DSH SDKs.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client';
 // Type-only: pulls the settings-surface SlotMap merge and ctx.settingsScope.
@@ -27,6 +29,7 @@ import {
 import { startBridge } from './bridge.ts';
 import { AutoContinueComposerToggle } from './composer-toggle.tsx';
 import type { SettingsScope } from './dsh-store-compat.ts';
+import { canWriteSettings } from './settings-form.ts';
 
 /** Dictionary namespace owned by this plugin. */
 const NS = 'auto-continue';
@@ -66,6 +69,7 @@ export const inject = ['slots', 'locale'];
 export {
   pausedSessions,
   readTodayStats,
+  readRecoveryAttempts,
   resetTodayStats,
   unpauseSession,
 } from './bridge.ts';
@@ -122,7 +126,7 @@ function mountSettings(ctx: ClientContext, scope: SettingsScope<AutoContinueSett
   const syncLocale = (): void => {
     const active = ctx.locale.getLocale().active;
     const snapshot = scope.getSnapshot();
-    if (snapshot.status !== 'ready' || !snapshot.writable || snapshot.mode !== 'host') return;
+    if (!canWriteSettings(snapshot)) return;
     // A genuine language switch is the only thing that earns a fresh budget: the
     // attempt count must survive matching snapshots, because the writing page's
     // own acknowledgement arrives as a match (see above). Tracking `mirroredLocale`
@@ -150,7 +154,7 @@ function mountSettings(ctx: ClientContext, scope: SettingsScope<AutoContinueSett
         name: 'conversation.input.left',
         id: 'auto-continue',
         locale: NS,
-        inject: () => controller.injectComposer(),
+        inject: (sessionId) => controller.injectComposer(sessionId),
       },
       AutoContinueComposerToggle,
     ),

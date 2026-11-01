@@ -13,17 +13,19 @@
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { AutoContinueRunner } from './host/engine.ts';
-import { resolveConfig, type AutoContinueSettings } from './shared/core.ts';
+import { LEGACY_SETTINGS_IMPORTED, migrateLegacySettings, type EntrySettings, type LiveEntrySettings } from './host/settings-migration.ts';
+import { isSessionMode, resolveConfig, type AutoContinueSettings } from './shared/core.ts';
 // Type-only: pulls the `ctx.webServer` Context augmentation.
 import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-session';
+import type {} from '@deepseek-ai/dsh-settings';
 
 /** Settings namespace of the auto-continue plugin (lowercase kebab-case). */
 export const AUTO_CONTINUE_NS = 'auto-continue';
 
 /** Wire schema; blank localized text fields tell resolveConfig() to select the active locale's defaults. */
-export const AutoContinueSchema = z.object({
+const settingsFields = {
   /** Active browser/UI locale mirrored by the client. */
   locale: z.string().default('zh'),
   /** Text automatically sent after an interruption. */
@@ -38,6 +40,8 @@ export const AutoContinueSchema = z.object({
   continueTextSilent: z.string().default(''),
   /** Text sent for each autonomous-loop continuation (same placeholders as `continueText`). */
   continueTextLoop: z.string().default(''),
+  /** Text sent when a turn is recovered after a harness restart closed it as interrupted. */
+  continueTextInterrupted: z.string().default(''),
   /** Idempotency guard: inspect the last tool call before resuming and steer the model. */
   guardTools: z.boolean().default(true),
   /** Guard text appended when the last tool call has no confirmed result (it may have partially executed). */
@@ -74,7 +78,9 @@ export const AutoContinueSchema = z.object({
   notify: z.boolean().default(false),
   /** Globally pause auto-continue: no live or scan send. */
   paused: z.boolean().default(false),
-  /** Show the global auto-continue switch in the conversation composer. */
+  /** Persist choices by session, including an explicit return to the profile default. */
+  sessionModes: z.dict(z.union(['default', 'off', 'recover', 'loop'])).default({}).hidden(),
+  /** Show the session mode selector in the conversation composer. */
   showComposerToggle: z.boolean().default(true),
   /** Loop guard: detect a running turn spinning in place and restart it. */
   loopGuard: z.boolean().default(true),
@@ -92,14 +98,18 @@ export const AutoContinueSchema = z.object({
   loopText: z
     .string()
     .default(''),
-});
+};
+export const AutoContinueSchema = z.object(settingsFields);
 
 /** Loader config is a live reference on DSH 0.1.7, and a plain object on older hosts. */
-export type AutoContinueEntryConfig = AutoContinueSettings | { get(): AutoContinueSettings | undefined };
+export type AutoContinueEntryConfig = EntrySettings | LiveEntrySettings;
 
 // Keep the wire schema usable by legacy Settings while exposing the live root
 // to current Loaders. Older Schemastery releases do not have volatile().
-const entrySchema = AutoContinueSchema as typeof AutoContinueSchema & {
+const entrySchema = z.object({
+  ...settingsFields,
+  [LEGACY_SETTINGS_IMPORTED]: z.boolean().default(false).hidden(),
+}) as typeof AutoContinueSchema & {
   volatile?: () => z<AutoContinueSettings, AutoContinueEntryConfig>;
 };
 export const Config = entrySchema.volatile?.() ?? AutoContinueSchema;
@@ -120,6 +130,10 @@ function entryConfig(config: AutoContinueEntryConfig | undefined): AutoContinueS
  */
 export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
   let legacyConfig: (() => AutoContinueSettings | undefined) | undefined;
+  const modern = config !== undefined && 'get' in config && typeof config.get === 'function';
+  const readEntry = modern
+    ? migrateLegacySettings(ctx, config, Object.keys(settingsFields), AutoContinueSchema)
+    : () => entryConfig(config);
   // Settings is optional: it must never prevent the engine or bridge starting.
   // Hosts predating Config-derived forms still own a separate settings document.
   ctx.inject(['settings'], (settingsCtx) => {
@@ -127,7 +141,9 @@ export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
       register?: (ns: string, schema: typeof AutoContinueSchema, options: { applies: string }) => unknown;
       get?: (ns: string) => AutoContinueSettings | undefined;
     } }).settings;
-    if (typeof settings.register !== 'function' || typeof settings.get !== 'function') return;
+    // Some desktop hosts expose both APIs. A live Config already owns this
+    // namespace, so registering it again splits reads and writes across stores.
+    if (modern || typeof settings.register !== 'function' || typeof settings.get !== 'function') return;
     settings.register(AUTO_CONTINUE_NS, AutoContinueSchema, { applies: 'live' });
     const read = () => settings.get!(AUTO_CONTINUE_NS);
     legacyConfig = read;
@@ -144,7 +160,12 @@ export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
   ctx.inject(['agents', 'webServer'], (engineCtx) => {
     // 回调重入时先清理旧引擎, 避免定时器与监听器叠加。
     disposeEngine?.();
-    const runner = new AutoContinueRunner(engineCtx, () => resolveConfig(legacyConfig?.() ?? entryConfig(config)));
+    const readConfig = () => resolveConfig(legacyConfig?.() ?? readEntry());
+    const runner = new AutoContinueRunner(engineCtx, readConfig);
+    const writableSettings = () => {
+      const settings = engineCtx.get('settings');
+      return settings?.writable && typeof settings.mutate === 'function' ? settings : undefined;
+    };
 
     // 状态桥: browser 侧订阅通知与运行时状态(SSE)。
     const sseClients = new Set<(data: string) => void>();
@@ -158,12 +179,21 @@ export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
         }
       }
     };
-    const statePayload = (): string =>
-      JSON.stringify({
+    const statePayload = (): string => {
+      const config = readConfig();
+      return JSON.stringify({
         type: 'state',
         stats: runner.todayStats(),
         paused: runner.activePauses(),
+        recoveryAttempts: runner.recentRecoveryAttempts(),
+        sessionPolicy: {
+          modes: config.sessionModes,
+          defaultMode: config.resumeCompletedTurns ? 'loop' : 'recover',
+          paused: config.paused,
+          writable: writableSettings() !== undefined,
+        },
       });
+    };
 
     runner.subscribeNotices(() => {
       for (const notice of runner.drainNotices()) {
@@ -173,6 +203,10 @@ export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
     runner.subscribeState(() => {
       pushToAll(`data: ${statePayload()}\n\n`);
     });
+    // Event names differ across the legacy Settings and live Config hosts.
+    const stopSettings = ['settings/updated', 'settings/document-updated', 'app-boot/config-reload'].map(event =>
+      (engineCtx.on as (event: string, listener: () => void) => () => void)(event, () => runner.configurationChanged()),
+    );
 
     const stopBridge = engineCtx.webServer.register({
       kind: 'exact',
@@ -207,9 +241,28 @@ export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
           body += chunk.toString('utf8');
           if (body.length > 4096) req.destroy();
         });
-        req.on('end', () => {
+        req.on('end', async () => {
           try {
-            const parsed = JSON.parse(body) as { sessionId?: string; action?: string };
+            const parsed = JSON.parse(body) as { sessionId?: string; action?: string; mode?: unknown };
+            if (parsed.action === 'set-session-mode') {
+              const { sessionId, mode } = parsed;
+              if (typeof sessionId !== 'string' || sessionId.trim() === '' || sessionId.length > 256 ||
+                  ['__proto__', 'prototype', 'constructor'].includes(sessionId) || !isSessionMode(mode)) {
+                throw new TypeError('Invalid session mode');
+              }
+              const settings = writableSettings();
+              if (settings === undefined) {
+                res.writeHead(503, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ ok: false }));
+                return;
+              }
+              // Path mutations preserve choices written concurrently by other tabs.
+              await settings.mutate(AUTO_CONTINUE_NS, [{ op: 'set', path: ['sessionModes', sessionId], value: mode }]);
+              runner.configurationChanged();
+              res.writeHead(200, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, sessionId, mode }));
+              return;
+            }
             if (typeof parsed.action === 'string') {
               runner.handleNoticeAction((parsed.sessionId as never) ?? undefined, parsed.action);
               res.writeHead(200, { 'content-type': 'application/json' });
@@ -230,6 +283,7 @@ export function apply(ctx: Context, config?: AutoContinueEntryConfig): void {
       if (disposed) return;
       disposed = true;
       runner.dispose();
+      for (const stop of stopSettings) stop();
       stopBridge();
       stopActions();
       for (const close of closeClients) close();

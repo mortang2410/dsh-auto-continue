@@ -32,12 +32,13 @@ function createSnapshotStore(initial) {
 }
 
 let registration;
+let pushBridge;
 vm.runInNewContext(bundle, {
   AbortController,
   console,
-  fetch: async () => {
-    throw new Error('offline UI test');
-  },
+  fetch: async () => ({ ok: true, body: { getReader: () => ({
+    read: () => new Promise(resolve => { pushBridge = event => resolve({ done: false, value: new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`) }); }),
+  }) } }),
   setTimeout: () => 0,
   clearTimeout: () => {},
   TextDecoder,
@@ -132,10 +133,7 @@ function render(locale) {
 
 for (const locale of ['en', 'zh']) {
   const html = render(locale);
-  assert.match(html, /href="https:\/\/github\.com\/HsiangNianian\/dsh-auto-continue"/);
-  assert.match(html, /target="_blank"/);
-  assert.match(html, /rel="noopener noreferrer"/);
-  assert.match(html, /HsiangNianian/);
+  assert.doesNotMatch(html, /dshAcHeaderFrame/, 'the colored header banner stays removed');
   assert.match(html, /role="tablist"/);
   assert.equal([...html.matchAll(/role="tab"/g)].length, 6);
   assert.match(html, /role="tabpanel"/);
@@ -144,12 +142,10 @@ for (const locale of ['en', 'zh']) {
     assert.doesNotMatch(button[0], /<a\b/, 'external link must not be nested in a button');
   }
 }
-assert.match(render('zh'), /觉得好用的话，点个 Star 吧/);
-assert.match(render('en'), /Finding it useful\? Leave a Star/);
-assert.match(render('en'), /<button\b(?=[^>]*aria-label="Auto-continue")(?=[^>]*aria-checked="true")/);
+assert.match(render('en'), /<button\b(?=[^>]*aria-label="Enable auto-continue globally")(?=[^>]*aria-checked="true")/);
+assert.match(render('en'), /<select[^>]*aria-label="Default session mode"/);
 face.edit('paused', 'true');
-assert.match(render('en'), /<button\b(?=[^>]*aria-label="Auto-continue")(?=[^>]*aria-checked="false")/, 'positive switch correctly stages the inverse paused setting');
-assert.match(render('en'), /dshAcStatus">Enabled</, 'header reports committed state until Save');
+assert.match(render('en'), /<button\b(?=[^>]*aria-label="Enable auto-continue globally")(?=[^>]*aria-checked="false")/, 'positive switch correctly stages the inverse paused setting');
 face.discard();
 
 const expected = Object.entries(face.hooks.autoContinueSettingsCard.getSnapshot())
@@ -168,6 +164,24 @@ for (const category of ['general', 'recovery', 'startup', 'prompts', 'safety', '
 }
 assert.deepEqual(visible.sort(), expected, 'each existing configuration field is reachable exactly once');
 
+for (let i = 0; i < 8; i++) await Promise.resolve();
+pushBridge({ type: 'state', recoveryAttempts: [
+  { sessionId: 'session-<example>', at: Date.now(), reason: 'silent', consecutive: 2 },
+  { sessionId: 'session-<example>', at: Date.now() - 1000, reason: 'max-tokens', consecutive: 1 },
+] });
+for (let i = 0; i < 8; i++) await Promise.resolve();
+activeCategory = 'status';
+assert.match(render('en'), /Recent recovery attempts/);
+assert.match(render('en'), /Attempts in window: 2/);
+assert.match(render('en'), /Consecutive at last send: 2/);
+assert.match(render('en'), /Latest reason: No visible output/);
+assert.match(render('en'), /session-&lt;example&gt;/, 'session identifiers are rendered as text');
+assert.match(render('en'), /<time[^>]*dateTime=/);
+assert.match(render('zh'), /最近原因: 无可见输出/);
+pushBridge({ type: 'state' });
+for (let i = 0; i < 8; i++) await Promise.resolve();
+assert.match(render('en'), /No recovery attempts yet/, 'older host payloads remain compatible');
+
 activeCategory = 'general';
 face.edit('cooldownMs', 'not a number');
 face.edit('continueText', 'Keep this draft');
@@ -177,4 +191,4 @@ activeCategory = 'prompts';
 assert.match(render('en'), />Keep this draft<\/textarea>/, 'category changes preserve drafts');
 face.discard();
 assert.doesNotMatch(render('en'), />Keep this draft<\/textarea>/);
-console.log('category settings UI, staged switches, and GitHub invitation ✅');
+console.log('category settings UI, staged switches, and banner-free header ✅');

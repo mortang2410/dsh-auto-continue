@@ -1,13 +1,5 @@
 /** 简体中文词典(键集的事实来源)。 */
 export declare const zh: {
-    'card.title': string;
-    'card.description': string;
-    'repo.star': string;
-    'repo.note': string;
-    'repo.link': string;
-    'repo.aria': string;
-    'chrome.enabled': string;
-    'chrome.paused': string;
     'chrome.saved': string;
     'notification.title': string;
     'notification.enabled': string;
@@ -17,6 +9,9 @@ export declare const zh: {
     'notification.unsupported': string;
     'notification.failed': string;
     'chrome.categories': string;
+    'repo.star': string;
+    'repo.link': string;
+    'repo.aria': string;
     'category.general.title': string;
     'category.general.description': string;
     'category.recovery.title': string;
@@ -33,7 +28,14 @@ export declare const zh: {
     'field.showComposerToggle': string;
     'field.showComposerToggleHint': string;
     'composer.label': string;
+    'composer.mode': string;
     'composer.scope': string;
+    'composer.default': string;
+    'composer.off': string;
+    'composer.recover': string;
+    'composer.loop': string;
+    'composer.paused': string;
+    'composer.unavailable': string;
     'composer.saving': string;
     'composer.saveFailed': string;
     'field.pausedHint': string;
@@ -53,6 +55,9 @@ export declare const zh: {
     'field.continueTextSilent': string;
     'field.continueTextSilentHint': string;
     'default.continueTextSilent': "继续。你上一轮只输出了内部推理, 既没有回复也没有调用工具, 用户什么都没看到。每一轮都要以工具调用或可见回复结束。";
+    'field.continueTextInterrupted': string;
+    'field.continueTextInterruptedHint': string;
+    'default.continueTextInterrupted': "继续。宿主在你上一轮运行期间重启了; 重启时未完成的工具调用已按「结果未知」收尾。从中断处继续, 重试可能有副作用的操作前先核实外部状态。";
     'field.guardTools': string;
     'field.guardToolsHint': string;
     'field.guardPendingText': string;
@@ -111,6 +116,18 @@ export declare const zh: {
     'stats.byCode': string;
     'stats.empty': string;
     'stats.reset': string;
+    'recovery.title': string;
+    'recovery.hint': string;
+    'recovery.empty': string;
+    'recovery.count': string;
+    'recovery.consecutive': string;
+    'recovery.latest': string;
+    'recovery.reason.error': string;
+    'recovery.reason.max-tokens': string;
+    'recovery.reason.silent': string;
+    'recovery.reason.interrupted': string;
+    'recovery.reason.loop-guard': string;
+    'recovery.reason.manual': string;
     'pause.title': string;
     'pause.none': string;
     'pause.clearAll': string;
@@ -120,6 +137,7 @@ export declare const zh: {
     'chrome.expand': string;
     'chrome.unsaved': string;
     'chrome.readOnly': string;
+    'chrome.unavailable': string;
     'chrome.saveFailed': string;
     'chrome.discard': string;
     'chrome.saving': string;

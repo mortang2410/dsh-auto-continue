@@ -26,13 +26,23 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Verify tag matches package version
+      - name: Verify version and release notes
         run: |
           version=$(node -p "require('./package.json').version")
           tag="${GITHUB_REF_NAME#v}"
           if [ "$version" != "$tag" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
             exit 1
+          fi
+          notes_file="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ ! -s "$notes_file" ]; then
+            echo "::error::missing release notes: $notes_file"
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            echo "RELEASE_DIST_TAG=next" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_DIST_TAG=latest" >> "$GITHUB_ENV"
           fi
           echo "Publishing dsh-client-auto-continue@$version from $GITHUB_REF_NAME"
 
@@ -62,7 +72,7 @@ jobs:
           echo "archive=${dir}.zip" >> "$GITHUB_ENV"
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: npm publish --access public --tag "$RELEASE_DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -76,7 +86,7 @@ jobs:
       - name: Publish to GitHub Packages
         run: |
           node scripts/prepare-github-package.mjs
-          npm publish --access public
+          npm publish --access public --tag "$RELEASE_DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
 
@@ -85,13 +95,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(node -p "require('./package.json').version")
-          if git describe --tags --abbrev=0 HEAD^ >/dev/null 2>&1; then
-            notes=$(git log --oneline --no-decorate "$(git describe --tags --abbrev=0 HEAD^)..HEAD")
-          else
-            notes=$(git log --oneline --no-decorate -10)
+          release_flags=()
+          if [[ "$version" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
           fi
           gh release create "$GITHUB_REF_NAME" \
             dist/*.tgz \
             "dist/${archive}" \
+            "${release_flags[@]}" \
             --title "dsh-auto-continue v$version" \
-            --notes "$notes"
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md"

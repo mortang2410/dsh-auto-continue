@@ -2458,7 +2458,12 @@ export class AutoContinueRunner {
           // Resume a child only when the host would: its own continuable descriptor, read past the inherited prefix,
           // and a parent to resume it under (checked again in continueChild, when the parent is known to be live).
           const inherited = handle.inheritedEventCount;
-          if (typeof inherited !== 'number' || header.parentSession === undefined) return undefined;
+          if (typeof inherited !== 'number' || header.parentSession === undefined) {
+            // No boot can ever continue this child: nothing resumes a session with no parent to continue it under. The
+            // log alone settles it, so the verdict is remembered instead of decoding the same log on every boot.
+            verdict.settled = true;
+            return undefined;
+          }
           childDescriptor = persistedChildDescriptor(events, inherited);
           if (childDescriptor === undefined) {
             this.log(`跳过 ${header.id}: 子代理没有可续跑的 descriptor`);

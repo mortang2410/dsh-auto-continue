@@ -93,6 +93,9 @@ export declare class AutoContinueRunner {
      */
     private persistedRejections;
     private persistedRejectionSave;
+    /** Id to the log revision a scan already settled, plus the config the verdict was reached under. */
+    private persistedSettled;
+    private persistedSettledSave;
     /** Eligible persisted sessions not yet resumed, newest activity first. */
     private persistedQueue;
     /** The single in-flight list() call. A stalled call is awaited again on later passes, never repeated. */
@@ -294,6 +297,15 @@ export declare class AutoContinueRunner {
     /** Persist the rejection record, coalescing bursts so one boot writes once. */
     private schedulePersistedRejectionSave;
     private savePersistedRejections;
+    /** Where the settled record lives: beside the rejection record, in the same DSH home this host was started with. */
+    private persistedSettledPath;
+    /** Load the settled record once per process, synchronously, so the scan can skip a row without yielding. */
+    private loadPersistedSettled;
+    /** The settled entries currently on disk, empty when the file is missing or unusable. */
+    private readPersistedSettledEntries;
+    /** Persist the settled record, coalescing bursts so one boot writes once. */
+    private schedulePersistedSettledSave;
+    private savePersistedSettled;
     /** The artifact's own revision, or undefined when the backend cannot report one cheaply. */
     private persistedRevision;
     /**

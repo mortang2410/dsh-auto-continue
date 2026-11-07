@@ -4,9 +4,30 @@
  * then publishes the agent with the persisted events and header. Like the host, it publishes after an await.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { mock, test } from 'node:test';
 import { makeHost } from './host-fixture.mjs';
+
+/** A real timer, captured before the fake clock replaces the global, so a test can wait for real disk writes. */
+const realSetTimeout = setTimeout;
+// Polls for the record instead of sleeping a fixed time: on a loaded machine the fs write
+// behind the 2 s coalescing timer lands well after any fixed wait that keeps the suite fast.
+const diskSettled = async (attempts = 500) => {
+  const file = join(process.env.DSH_HOME, 'auto-continue-settled.json');
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const record = JSON.parse(readFileSync(file, 'utf8'));
+      if (record && record.entries && Object.keys(record.entries).length > 0) return record;
+      throw new Error('no entries yet');
+    } catch {
+      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+    }
+  }
+  throw new Error('the settled record did not appear');
+};
 
 const settle = async (ms = 0) => {
   mock.timers.tick(ms);
@@ -35,6 +56,7 @@ const OPEN = () => [turnStart(1), userPrompt()];
 const record = (id, events, header = {}) => ({
   header: { id, version: 1, createdAt: Date.now(), cwd: '/work', isSeeded: false, ...header },
   events,
+  revision: 'r1',
 });
 
 /** Turn number of the last turn that was started and never ended, or undefined. */
@@ -46,7 +68,7 @@ function openTurn(events) {
 
 /** Persisted-session service: read-only opens, with counters the tests assert on. */
 function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
-  const state = { lists: 0, opens: [], reads: 0, closes: 0, failuresLeft: listFailures };
+  const state = { lists: 0, opens: [], reads: 0, stats: 0, closes: 0, failuresLeft: listFailures };
   return {
     state,
     async list() {
@@ -56,7 +78,12 @@ function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
         state.failuresLeft -= 1;
         throw new Error('list unavailable');
       }
-      return [...records.values()].map(({ header }) => ({ header, revision: 'r1' }));
+      return [...records.values()].map(({ header, revision }) => ({ header, revision }));
+    },
+    async stat(id) {
+      state.stats += 1;
+      const stored = records.get(id);
+      return stored === undefined ? undefined : { header: stored.header, revision: stored.revision };
     },
     async open(id, access) {
       state.opens.push({ id, access });
@@ -65,6 +92,10 @@ function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
       if (stored === undefined) throw new Error(`no session ${id}`);
       return {
         header: stored.header,
+        // The real store's read handle always reports this (a getter over its state, 0 by default); mirror it so a
+        // backend-capability gap cannot masquerade as a log fact.
+        get inheritedEventCount() { return stored.inheritedEventCount ?? 0; },
+        async stat() { return { header: stored.header, revision: stored.revision }; },
         async read() { state.reads += 1; return { eventState: 'owned', events: [...stored.events] }; },
         async close() { state.closes += 1; },
       };
@@ -845,3 +876,142 @@ test('T29 a live agent whose graceful-stop turn (aborted, disposed) the user ans
   assert.equal(host.agents.get('live').followups.length, 0, 'the scanner sends no followup');
   assert.equal(host.stats().sent, 0, 'no continuation is counted as sent');
 }));
+
+/** A DSH_HOME of its own, so one fixture's settled record never leaks into another. */
+async function withHome(run) {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    await run(home);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
+test('T31 a second boot does not decode a child log the first boot settled', () => withHome(async () => clocked(async () => {
+  const child = record('child', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'parent' });
+  const first = scenario({ sessions: [child] });
+  first.host.start();
+  await settle();
+  await nextPass();
+  await settle(2000);
+  await diskSettled();
+  const firstReads = first.store.state.reads;
+
+  const second = scenario({ sessions: [child] });
+  second.host.start();
+  await settle();
+  await nextPass();
+
+  assert.equal(firstReads, 1, 'the first boot decodes the child log once');
+  assert.equal(second.store.state.reads, 0, 'the second boot spends no decode on it');
+  assert.ok(second.store.state.stats >= 1, 'the skip is decided from the cheap stat');
+  assert.equal(second.store.state.opens.length, 0, 'and never opens it for a read');
+})));
+
+test('T32 a log whose revision changed is decoded again', () => withHome(async () => clocked(async () => {
+  const child = record('child', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'parent' });
+  const first = scenario({ sessions: [child] });
+  first.host.start();
+  await settle();
+  await nextPass();
+  await settle(2000);
+  await diskSettled();
+
+  child.revision = 'r2';
+  const second = scenario({ sessions: [child] });
+  second.host.start();
+  await settle();
+  await nextPass();
+
+  assert.equal(second.store.state.reads, 1, 'a new revision earns a fresh read');
+})));
+
+test('T33 a session with something to resume is not settled across boots', () => withHome(async (home) => clocked(async () => {
+  const session = record('a', log(OPEN()));
+  // A settled sibling makes the record exist, so the assertion below proves the resumable id is absent from it.
+  const settledChild = record('child', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+  const first = scenario({ sessions: [session, settledChild] });
+  first.host.start();
+  await settle();
+  await nextPass();
+  await settle(2000);
+  await diskSettled();
+
+  const second = scenario({ sessions: [session, settledChild] });
+  second.host.start();
+  await settle();
+  await nextPass();
+
+  const settledFile = join(home, 'auto-continue-settled.json');
+  const recorded = existsSync(settledFile) ? readFileSync(settledFile, 'utf8') : '';
+  assert.equal(recorded.includes('"a"'), false, 'a resumable session is never written as settled');
+  assert.equal(second.store.state.reads, 1, 'a resumable session is read on every boot');
+  assert.equal(second.resumes.length, 1, 'and resumed again');
+})));
+
+test('T34 a settings change between boots does not freeze a settled child', () => withHome(async () => clocked(async () => {
+  const child = record('child', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'parent' });
+  const first = scenario({ sessions: [child] });
+  first.host.start();
+  await settle();
+  await nextPass();
+  await settle(2000);
+  await diskSettled();
+
+  // Every setting that could reach a verdict changes here; none of them may revive a decode of an unchanged log.
+  const second = scenario({
+    sessions: [child],
+    overrides: { freshMs: 60_000, classify: false, loopText: 'different loop text', guardTools: false, guardPendingText: '', guardDoneText: '' },
+  });
+  second.host.start();
+  await settle();
+  await nextPass();
+
+  assert.equal(second.store.state.reads, 0, 'the settled child is still skipped');
+})));
+
+test('T35 a session older than freshMs is decoded on every boot, never settled', () => withHome(async () => clocked(async () => {
+  // The age window is a function of the wall clock, not of the log, so the verdict must not be remembered.
+  const old = record('old', log([turnStart(1), turnEnd(1, { kind: 'max-tokens' })], Date.now() - 60_000));
+  const first = scenario({ sessions: [old], overrides: { freshMs: 1_000 } });
+  first.host.start();
+  await settle();
+  await nextPass();
+  await settle(2000);
+
+  const second = scenario({ sessions: [old], overrides: { freshMs: 1_000 } });
+  second.host.start();
+  await settle();
+  await nextPass();
+
+  assert.equal(second.store.state.reads, 1, 'the too-old log is decoded again');
+})));
+
+test('T37 a row another host writes after this one loaded survives the save', () => withHome(async (home) => clocked(async () => {
+  const childB = record('childB', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+  const host = scenario({ sessions: [childB] });
+  host.host.start();
+  // Let the scan load its (empty) record before the other host writes, then let its own save run.
+  await settle();
+  const file = join(home, 'auto-continue-settled.json');
+  const childA = record('childA', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+  writeFileSync(file, `${JSON.stringify({ version: 1, entries: { childA: childA.revision } })}\n`, 'utf8');
+  await nextPass();
+  await settle(2000);
+  for (let i = 0; i < 500; i += 1) {
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'));
+      if (Object.keys(parsed.entries).length === 2) {
+        assert.deepEqual(Object.keys(parsed.entries).sort(), ['childA', 'childB'], 'neither host dropped the other');
+        return;
+      }
+    } catch {}
+    await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+  }
+  assert.fail('the merged record never held both rows');
+})));
+

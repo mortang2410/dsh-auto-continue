@@ -15,7 +15,7 @@
 
 import type { Context } from '@deepseek-ai/cordis';
 import { readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -387,6 +387,13 @@ const PERSISTED_REJECTION_VERSION = 1;
 /** Upper bound on remembered rejections, so the record cannot grow without limit on a large store. */
 const PERSISTED_REJECTION_MAX = 5_000;
 
+/**
+ * The record of stored logs a scan already read cleanly at a given revision, so a later boot does not decode them again.
+ * Every read parses a whole log, and a settled log cannot need a resume until its bytes change.
+ */
+const SETTLED_RECORD_VERSION = 1;
+const SETTLED_RECORD_MAX = 5_000;
+
 interface PersistedPresets {
   resolve(id?: string): Promise<{ readonly id: string }>;
   mount(agentCtx: Context, id?: string): Promise<unknown>;
@@ -749,6 +756,9 @@ export class AutoContinueRunner {
    */
   private persistedRejections: Map<string, string> | undefined;
   private persistedRejectionSave: ReturnType<typeof setTimeout> | undefined;
+  /** Id to the log revision a scan already settled, plus the config the verdict was reached under. */
+  private persistedSettled: Map<string, string> | undefined;
+  private persistedSettledSave: ReturnType<typeof setTimeout> | undefined;
   /** Eligible persisted sessions not yet resumed, newest activity first. */
   private persistedQueue: PersistedEntry[] = [];
   /** The single in-flight list() call. A stalled call is awaited again on later passes, never repeated. */
@@ -944,6 +954,10 @@ export class AutoContinueRunner {
     this.stopStoredSweep.abort();
     if (this.bootScanTimer !== undefined) clearTimeout(this.bootScanTimer);
     this.bootScanTimer = undefined;
+    if (this.persistedSettledSave !== undefined) clearTimeout(this.persistedSettledSave);
+    this.persistedSettledSave = undefined;
+    if (this.persistedRejectionSave !== undefined) clearTimeout(this.persistedRejectionSave);
+    this.persistedRejectionSave = undefined;
     this.wakeBootScan?.();
     this.wakeBootScan = undefined;
     // Each child still waiting is dropped and logged once. Nothing is sent after dispose.
@@ -2258,6 +2272,78 @@ export class AutoContinueRunner {
     }
   }
 
+  /** Where the settled record lives: beside the rejection record, in the same DSH home this host was started with. */
+  private persistedSettledPath(): string {
+    const configured = process.env.DSH_HOME;
+    const home = configured !== undefined && configured !== '' ? configured : join(homedir(), '.dsh');
+    return join(home, 'auto-continue-settled.json');
+  }
+
+  /** Load the settled record once per process, synchronously, so the scan can skip a row without yielding. */
+  private loadPersistedSettled(): Map<string, string> {
+    const cached = this.persistedSettled;
+    if (cached !== undefined) return cached;
+    const record = this.readPersistedSettledEntries();
+    this.persistedSettled = record;
+    return record;
+  }
+
+  /** The settled entries currently on disk, empty when the file is missing or unusable. */
+  private readPersistedSettledEntries(): Map<string, string> {
+    const entries = new Map<string, string>();
+    try {
+      const raw = readFileSync(this.persistedSettledPath(), 'utf8');
+      const parsed = JSON.parse(raw) as { readonly version?: unknown; readonly entries?: unknown };
+      if (parsed.version === SETTLED_RECORD_VERSION && parsed.entries !== null && typeof parsed.entries === 'object') {
+        for (const [id, revision] of Object.entries(parsed.entries as Record<string, unknown>)) {
+          if (typeof revision === 'string' && revision !== '') entries.set(id, revision);
+        }
+      }
+    } catch (error) {
+      if ((error as { readonly code?: unknown } | null)?.code !== 'ENOENT') {
+        this.log(`读取已判定会话记录出错, 本次启动忽略: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return entries;
+  }
+
+  /** Persist the settled record, coalescing bursts so one boot writes once. */
+  private schedulePersistedSettledSave(): void {
+    if (this.persistedSettledSave !== undefined) return;
+    this.persistedSettledSave = setTimeout(() => {
+      this.persistedSettledSave = undefined;
+      void this.savePersistedSettled();
+    }, 2_000);
+  }
+
+  private async savePersistedSettled(): Promise<void> {
+    const record = this.persistedSettled;
+    if (record === undefined) return;
+    // Another host on this home may have settled rows since this one loaded; merge them so neither writer wins alone.
+    // Moving this process's ids to the end keeps the cap evicting the least recently written rows.
+    const merged = this.readPersistedSettledEntries();
+    for (const [id, revision] of record) {
+      merged.delete(id);
+      merged.set(id, revision);
+    }
+    const entries: Record<string, string> = {};
+    let kept = 0;
+    for (const [id, revision] of merged) {
+      if (kept >= SETTLED_RECORD_MAX) break;
+      entries[id] = revision;
+      kept += 1;
+    }
+    const path = this.persistedSettledPath();
+    const temporary = `${path}.${process.pid}.tmp`;
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(temporary, `${JSON.stringify({ version: SETTLED_RECORD_VERSION, entries })}\n`, 'utf8');
+      await rename(temporary, path);
+    } catch (error) {
+      this.log(`写入已判定会话记录出错: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   /** The artifact's own revision, or undefined when the backend cannot report one cheaply. */
   private async persistedRevision(persistence: PersistedStore, id: SessionId): Promise<string | undefined> {
     const stat = persistence.stat;
@@ -2299,20 +2385,32 @@ export class AutoContinueRunner {
     // resuming that root a second time.
     const sweepOwnsRoots = this.ctx.get('sessionQuery') !== undefined;
     const rejections = this.loadPersistedRejections();
+    const settled = this.loadPersistedSettled();
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
+      // One stat decides whether the log needs decoding at all: a read parses the whole log, which is the expensive part
+      // of the pass, and the revision changes as soon as the bytes do.
+      const revision = await this.persistedRevision(persistence, header.id);
+      // A settled log is one a scan already read cleanly at this revision and found nothing to resume.
+      if (revision !== undefined && settled.get(header.id) === revision) continue;
       // A log this scan already rejected is skipped without decoding it, but only while the artifact is unchanged:
-      // a repaired file has a new revision and gets a fresh attempt. The revision is only asked for a session the
-      // record already names, so a healthy store pays nothing for this.
-      if (rejections.has(header.id)) {
-        const revision = await this.persistedRevision(persistence, header.id);
-        if (revision !== undefined && rejections.get(header.id) === revision) continue;
+      // a repaired file has a new revision and gets a fresh attempt.
+      if (rejections.has(header.id) && revision !== undefined && rejections.get(header.id) === revision) continue;
+      const verdict = { settled: false };
+      const entry = await this.readPersistedEntry(persistence, header, now, config, verdict);
+      if (entry !== undefined) {
+        queue.push(entry);
+        if (settled.delete(header.id)) this.schedulePersistedSettledSave();
+        continue;
       }
-      const entry = await this.readPersistedEntry(persistence, header, now, config);
-      if (entry !== undefined) queue.push(entry);
+      // Only a verdict the log itself settles is remembered; a stall or an ended window is this boot's property.
+      if (verdict.settled && revision !== undefined && settled.get(header.id) !== revision) {
+        settled.set(header.id, revision);
+        this.schedulePersistedSettledSave();
+      }
     }
     // Shallower sessions first, so a child's live parent is resumed before the child (resumeEntry needs it live).
     queue.sort((left, right) => left.depth - right.depth || right.lastActivityAt - left.lastActivityAt);
@@ -2340,6 +2438,7 @@ export class AutoContinueRunner {
     header: PersistedHeader,
     now: number,
     config: AutoContinueConfig,
+    verdict: { settled: boolean },
   ): Promise<PersistedEntry | undefined> {
     try {
       const opening = persistence.open(header.id, 'read');
@@ -2363,6 +2462,7 @@ export class AutoContinueRunner {
           childDescriptor = persistedChildDescriptor(events, inherited);
           if (childDescriptor === undefined) {
             this.log(`跳过 ${header.id}: 子代理没有可续跑的 descriptor`);
+            verdict.settled = true;
             return undefined;
           }
           // The child's own turns decide eligibility. An inherited parent turn is not a turn of this child.

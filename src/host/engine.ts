@@ -14,7 +14,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
@@ -2183,13 +2184,16 @@ export class AutoContinueRunner {
     return join(home, 'auto-continue-rejections.json');
   }
 
-  /** Load the rejection record once per process. An unreadable record is ignored, never fatal. */
-  private async loadPersistedRejections(): Promise<Map<string, string>> {
+  /**
+   * Load the rejection record once per process. Read synchronously so a caller can decide to skip a session inside
+   * a loop that must not yield: the file is small and only the first call touches disk.
+   */
+  private loadPersistedRejections(): Map<string, string> {
     const cached = this.persistedRejections;
     if (cached !== undefined) return cached;
     const record = new Map<string, string>();
     try {
-      const raw = await readFile(this.persistedRejectionPath(), 'utf8');
+      const raw = readFileSync(this.persistedRejectionPath(), 'utf8');
       const parsed = JSON.parse(raw) as { readonly version?: unknown; readonly entries?: unknown };
       if (parsed.version === PERSISTED_REJECTION_VERSION && parsed.entries !== null && typeof parsed.entries === 'object') {
         for (const [id, revision] of Object.entries(parsed.entries as Record<string, unknown>)) {
@@ -2273,7 +2277,7 @@ export class AutoContinueRunner {
     // If sessionQuery registers after this read, the loader may already own a root; bootResumeClaims keeps the sweep from
     // resuming that root a second time.
     const sweepOwnsRoots = this.ctx.get('sessionQuery') !== undefined;
-    const rejections = await this.loadPersistedRejections();
+    const rejections = this.loadPersistedRejections();
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
@@ -2379,7 +2383,7 @@ export class AutoContinueRunner {
         }
         if (this.persistedRejections?.has(header.id) === true) {
           // The same artifact now reads cleanly, so any older rejection of it is stale.
-          const rejections = await this.loadPersistedRejections();
+          const rejections = this.loadPersistedRejections();
           if (rejections.delete(header.id)) this.schedulePersistedRejectionSave();
         }
         return {
@@ -2400,7 +2404,7 @@ export class AutoContinueRunner {
       if (!(error instanceof PersistedCallTimeout)) {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined) {
-          const rejections = await this.loadPersistedRejections();
+          const rejections = this.loadPersistedRejections();
           rejections.set(header.id, revision);
           this.schedulePersistedRejectionSave();
         }
@@ -2969,6 +2973,9 @@ export class AutoContinueRunner {
       this.ctx.logger.info(`存储扫描就绪: ${records.length} 个会话记录`);
     }
     let observed = 0;
+    // Every stored root below is decoded in full, so a log this chain already failed to read is skipped here too.
+    // The record is read once and synchronously: a session it does not name costs one map lookup, no await.
+    const rejections = this.loadPersistedRejections();
     for (const record of records) {
       if (this.disposed || Date.now() >= deadline || this.getConfig().paused || !this.getConfig().scanOnBoot) return;
       if (typeof record?.header?.id !== 'string' || record.header.id === '') {
@@ -2980,6 +2987,11 @@ export class AutoContinueRunner {
       if (record.live || this.storedSwept.has(sessionId)) continue;
       this.storedSwept.add(sessionId);
       if (record.header.origin === 'subagent') continue;
+      if (rejections.has(sessionId)) {
+        const persistence = this.ctx.get('sessionPersistence') as PersistedStore | undefined;
+        const known = persistence === undefined ? undefined : await this.persistedRevision(persistence, sessionId);
+        if (known !== undefined && rejections.get(sessionId) === known) continue;
+      }
       observed += 1;
       let observation: StoredObservation | undefined;
       try {

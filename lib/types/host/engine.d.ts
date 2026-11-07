@@ -281,7 +281,10 @@ export declare class AutoContinueRunner {
      * Where the rejection record lives: the DSH home this host was started with, else the default one.
      */
     private persistedRejectionPath;
-    /** Load the rejection record once per process. An unreadable record is ignored, never fatal. */
+    /**
+     * Load the rejection record once per process. Read synchronously so a caller can decide to skip a session inside
+     * a loop that must not yield: the file is small and only the first call touches disk.
+     */
     private loadPersistedRejections;
     /** Persist the rejection record, coalescing bursts so one boot writes once. */
     private schedulePersistedRejectionSave;

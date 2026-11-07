@@ -1950,3 +1950,77 @@ test('LOAD-8 a live parent keeps the existing path: no parent load, no parent-lo
     cap.restore();
   }
 }));
+
+// ===== Round 1 review, finding 1 (P1): the paused check ran once at the top of loadParent, then the method awaited the
+// stored read and the preset resolution and re-checked only archive state and the boot window. A parent the operator
+// paused during those awaits was still claimed and resumed, against ticket 02's rule that a paused parent is never
+// resumed. The pause below lands inside the load's preset await, after the top check has already passed.
+test('LOAD-9 a parent paused while its load awaits preset resolution is not claimed or resumed', () => clocked(async () => {
+  const cap = captureLogLines();
+  try {
+    const { host, services, sends, pluginResumes } = scenario({
+      parent: false,
+      sessions: [
+        record('kid', log(CHILD_OPEN()), { delegationDepth: 1 }),
+        record('parent', log(COMPLETED_PARENT()), { origin: undefined, parentSession: undefined, agentPreset: 'planner' }),
+      ],
+    });
+    const resolve = services.agentPresets.resolve;
+    let pausedDuringLoad = false;
+    services.agentPresets.resolve = async (preset) => {
+      const resolved = await resolve(preset);
+      if (preset === 'planner') {
+        // The operator pauses this parent while the load is between its stored read and its host call.
+        host.config.sessionModes = { parent: 'off' };
+        pausedDuringLoad = true;
+      }
+      return resolved;
+    };
+    host.start();
+    await settle();
+    await nextPass();
+    assert.equal(pausedDuringLoad, true, 'the pause is set inside the load, after its stored read');
+    assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), [], 'a parent paused during the load is never resumed');
+    assert.equal(sends.length, 0, 'the child is not continued under a parent that was not loaded');
+    assert.equal(host.listenerCount('agent/created'), 1, 'the child keeps today wait for the parent');
+    assert.ok(cap.lines.includes('error: [auto-continue] failed to load parent parent for child kid: the parent session is paused'),
+      `the refusal names the pause; got ${JSON.stringify(cap.lines)}`);
+    assert.ok(!cap.lines.some((line) => line.includes('loaded parent')), 'no load is reported');
+  } finally {
+    cap.restore();
+  }
+}));
+
+// ===== Round 1 review, finding 2 (P1): for a nested parent the route came from the parent's own history (the
+// inherited prefix trimmed) but the preset was read over the whole event list, so an `agent-preset/selected` event in
+// the inherited prefix won over the parent's own creation preset. This parent records no preset of its own, only the
+// creation preset in its header, so the inherited one is what the untrimmed scan finds first.
+test('LOAD-10 a nested parent mounts the preset its own log records, not the one inherited from its parent', () => clocked(async () => {
+  const inherited = [
+    routeHeader({ provider: 'deepseek', model: 'root-model' }),
+    { type: 'agent-preset/selected', data: { agentPreset: 'root-preset' } },
+    userPrompt(),
+  ];
+  const { host, sends, pluginResumes, services } = scenario({
+    parent: false,
+    sessions: [
+      record('kid', log(CHILD_OPEN()), { delegationDepth: 2 }),
+      record('parent', log([
+        ...inherited,
+        routeHeader({ provider: 'deepseek', model: 'nested-model' }), turnStart(1), userPrompt(),
+        turnEnd(1, { kind: 'completed' }),
+      ]), { parentSession: 'grandparent', delegationDepth: 1, agentPreset: 'nested-preset' }, { inheritedEventCount: inherited.length }),
+    ],
+  });
+  const mounts = spyMounts(services);
+  host.start();
+  await settle();
+  await nextPass();
+  assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), ['parent'], 'the nested parent resumes as a session');
+  assert.deepEqual(pluginResumes[0].agentOptions, { provider: 'deepseek', model: 'nested-model' },
+    'the route comes from the parent own history');
+  assert.deepEqual(mounts.map((mount) => mount.id), ['nested-preset'],
+    'the parent own creation preset is mounted, not the inherited selection');
+  assert.equal(sends.length, 1, 'the child is continued under the loaded parent');
+  assert.equal(sends[0].sender, host.agents.get('parent'));
+}));

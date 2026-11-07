@@ -2652,10 +2652,12 @@ export class AutoContinueRunner {
       let preset: string | undefined;
       try {
         const { events } = await withPersistedTimeout(stored.read(0));
-        // An inherited prefix is not this parent's own history, so its route is the one its own turns ran on.
+        // An inherited prefix is not this parent's own history: its route and its preset are the ones its own turns ran
+        // on, and the header's creation preset is the fallback, never a selection the root made for itself.
         const inherited = stored.header.origin === 'subagent' ? stored.inheritedEventCount : 0;
-        route = persistedRoute(inherited > 0 ? events.slice(inherited) : events);
-        preset = persistedPreset(stored.header, events);
+        const own = inherited > 0 ? events.slice(inherited) : events;
+        route = persistedRoute(own);
+        preset = persistedPreset(stored.header, own);
       } finally {
         await withPersistedTimeout(stored.close()).catch(() => undefined);
       }
@@ -2670,12 +2672,16 @@ export class AutoContinueRunner {
           await presets.mount(agentCtx, presetId);
         };
       }
-      // Archive and window are re-checked after the last await, right before the host call.
+      // Archive, window, and pause are re-checked after the last await, right before the host call.
       const registry = this.ctx.get('workspaceRegistry') as PersistedRegistry | undefined;
       if (registry === undefined || registry.archivedSessionIds.includes(parentSession)) {
         return failed('the parent session is archived');
       }
       if (!this.persistedOpen()) return failed('the boot window has ended');
+      // The operator can pause this parent while the load awaits its stored read and its preset. The top check read the
+      // state before those awaits, so the pause is read again here, in the same tick as the claim and the host call: a
+      // parent paused in that window is never opened.
+      if (this.sessionConfig(parentSession).paused) return failed('the parent session is paused');
       // Checked and claimed in the same tick as the host call. A parent that became live during the reads above is used
       // by the wait fallback at once (deferForParent attempts immediately), and a claim from the stored sweep or the
       // loader means this boot already resumes it; either way this path starts nothing.

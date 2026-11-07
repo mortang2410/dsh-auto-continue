@@ -2387,28 +2387,20 @@ export class AutoContinueRunner {
     const rejections = this.loadPersistedRejections();
     const settled = this.loadPersistedSettled();
     for (const { header } of snapshots) {
-      // The open below gets its own call budget, so a pass that no longer has one must not start it.
       if (!this.persistedOpen()) return;
-      if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) {
-        // A settled row for a session that is now live can never be consulted again, so it leaves the record here
-        // rather than waiting for the cap to evict it. The record is keyed by id, so this needs no revision read.
-        if (settled.delete(header.id)) this.schedulePersistedSettledSave();
-        continue;
-      }
+      if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
       // One stat decides whether the log needs decoding at all: a read parses the whole log, which is the expensive part
       // of the pass, and the revision changes as soon as the bytes do.
       const revision = await this.persistedRevision(persistence, header.id);
-      // The stat waits up to one call budget, so the deadline is read again before a call that would cost another.
-      if (!this.persistedOpen()) return;
       // A settled log is one a scan already read cleanly at this revision and found nothing to resume.
       if (revision !== undefined && settled.get(header.id) === revision) continue;
       // A log this scan already rejected is skipped without decoding it, but only while the artifact is unchanged:
       // a repaired file has a new revision and gets a fresh attempt.
       if (rejections.has(header.id) && revision !== undefined && rejections.get(header.id) === revision) continue;
       const verdict = { settled: false };
-      const entry = await this.readPersistedEntry(persistence, header, now, this.sessionConfig(header.id), verdict);
+      const entry = await this.readPersistedEntry(persistence, header, now, config, verdict);
       if (entry !== undefined) {
         queue.push(entry);
         if (settled.delete(header.id)) this.schedulePersistedSettledSave();
@@ -2529,9 +2521,8 @@ export class AutoContinueRunner {
       }
     } catch (error) {
       // A stall is a property of this boot, not of the log, so only a real read failure is remembered. The revision
-      // is read here, once, rather than for every row up front. A last such failure in the window is not remembered
-      // either: a row recorded but never finished is how a child upset by a sweep of this host was refused for good.
-      if (!(error instanceof PersistedCallTimeout) && this.persistedOpen()) {
+      // is read here, once, rather than for every row up front.
+      if (!(error instanceof PersistedCallTimeout)) {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined) {
           const rejections = this.loadPersistedRejections();

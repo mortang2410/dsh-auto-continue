@@ -2024,3 +2024,73 @@ test('LOAD-10 a nested parent mounts the preset its own log records, not the one
   assert.equal(sends.length, 1, 'the child is continued under the loaded parent');
   assert.equal(sends[0].sender, host.agents.get('parent'));
 }));
+
+// ===== Ticket 03: the child classes this host cannot continue, each with the refusal line it emits. =====
+// No production behavior is added by this ticket: the engine already refuses these classes, so each test pins the
+// exact line and the absence of both continuation paths. A child with no descriptor, a one-shot child, a malformed
+// descriptor, a descriptor that pins only one of provider and model, and a descriptor version this build does not
+// know are all refused at the boot listing (`readPersistedEntry`), one shared line that names the missing resumable
+// descriptor. An unpinned child passes that check and is refused before delivery (`deliverChild`), which has its own
+// line. The shared line names the condition, not the class, so each test title names the class it covers.
+const bootSkip = (text) => `info: [auto-continue] ${text}`;
+const noDescriptorLine = (id) => bootSkip(`跳过 ${id}: 子代理没有可续跑的 descriptor`);
+const unpinnedLine = (id) => bootSkip(`skip ${id}: the child pins no provider and model, so the child is not continued`);
+
+/** Run one boot with a single persisted child, then assert it is refused and the exact skip line is the reason. */
+async function assertChildRefused(id, events, expectedLine) {
+  const cap = captureLogLines();
+  try {
+    const { host, resumes, pluginResumes, sends } = scenario({
+      overrides: { verbose: true },
+      sessions: [record(id, log(events))],
+    });
+    host.start();
+    await settle();
+    await nextPass();
+    assert.equal(pluginResumes.length, 0, 'ctx.agents.resume is not called for the child');
+    assert.equal(resumes.length, 0, 'the host cold-resumes nothing for the child');
+    assert.equal(sends.length, 0, 'no Continue is sent');
+    assert.ok(cap.lines.includes(expectedLine),
+      `expected the skip line ${JSON.stringify(expectedLine)}; got ${JSON.stringify(cap.lines)}`);
+  } finally {
+    cap.restore();
+  }
+}
+
+test('U1 a child with no descriptor is refused, named by the boot line', () => clocked(async () => {
+  await assertChildRefused('no-descriptor', OPEN(), noDescriptorLine('no-descriptor'));
+}));
+
+// A one-shot child carries a descriptor the host does not resume. It fails the same descriptor fold, so the line
+// names the missing resumable descriptor rather than the mode.
+test('U2 a one-shot child is refused, named by the boot line', () => clocked(async () => {
+  await assertChildRefused('one-shot',
+    [...OPEN(), descriptorEvent({ version: 3, mode: 'one-shot', provider: 'in-process', label: 'one-shot' })],
+    noDescriptorLine('one-shot'));
+}));
+
+test('U3 a malformed descriptor is refused, named by the boot line', () => clocked(async () => {
+  await assertChildRefused('malformed',
+    [routeHeader(), ...OPEN(), descriptorEvent({ ...CONTINUABLE, toolFilter: { allow: 'read_file' } })],
+    noDescriptorLine('malformed'));
+}));
+
+// The unpinned child passes the descriptor fold and is refused before delivery, so it has its own line. It carries a
+// logged route, so only the pin check can be why no Continue was sent.
+test('U4 a child that pins no provider or model is refused, named by the unpinned line', () => clocked(async () => {
+  await assertChildRefused('unpinned', [routeHeader(), ...OPEN(), descriptorEvent(UNPINNED)], unpinnedLine('unpinned'));
+}));
+
+// Pinning one of the two cannot be resumed the way the host resumes a child, so the descriptor fold refuses it.
+test('U5 a descriptor that pins only one of provider and model is refused, named by the boot line', () => clocked(async () => {
+  const { agentModel, ...halfPinned } = CONTINUABLE;
+  assert.equal(typeof agentModel, 'string');
+  await assertChildRefused('half-pinned', [routeHeader(), ...OPEN(), descriptorEvent(halfPinned)],
+    noDescriptorLine('half-pinned'));
+}));
+
+test('U6 a descriptor version this build does not know is refused, named by the boot line', () => clocked(async () => {
+  await assertChildRefused('unknown-version',
+    [routeHeader(), ...OPEN(), descriptorEvent({ ...CONTINUABLE, version: 4 })],
+    noDescriptorLine('unknown-version'));
+}));

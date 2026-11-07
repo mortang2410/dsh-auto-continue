@@ -45,7 +45,7 @@ function openTurn(events) {
 }
 
 /** Persisted-session service: read-only opens, with counters the tests assert on. */
-function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
+function persistence(records, { listFailures = 0, listGate, openGate, readGate } = {}) {
   const state = { lists: 0, opens: [], reads: 0, closes: 0, failuresLeft: listFailures };
   return {
     state,
@@ -65,7 +65,11 @@ function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
       if (stored === undefined) throw new Error(`no session ${id}`);
       return {
         header: stored.header,
-        async read() { state.reads += 1; return { eventState: 'owned', events: [...stored.events] }; },
+        async read() {
+          state.reads += 1;
+          if (readGate !== undefined) await readGate;
+          return { eventState: 'owned', events: [...stored.events] };
+        },
         async close() { state.closes += 1; },
       };
     },
@@ -76,10 +80,10 @@ const hosts = [];
 
 /** One fake host with a persisted store. Services default to an empty archive and a default model. */
 function scenario({
-  sessions = [], overrides = {}, services = {}, resumeError, listFailures, listGate, openGate, hangResume = [], resumeDelay = {},
+  sessions = [], overrides = {}, services = {}, resumeError, listFailures, listGate, openGate, readGate, hangResume = [], resumeDelay = {},
 } = {}) {
   const records = new Map(sessions.map((item) => [item.header.id, item]));
-  const store = persistence(records, { listFailures, listGate, openGate });
+  const store = persistence(records, { listFailures, listGate, openGate, readGate });
   const resumes = [];
   const disposals = [];
   const published = [];
@@ -844,4 +848,21 @@ test('T29 a live agent whose graceful-stop turn (aborted, disposed) the user ans
   assert.equal(host.agents.size, 1, 'no second agent');
   assert.equal(host.agents.get('live').followups.length, 0, 'the scanner sends no followup');
   assert.equal(host.stats().sent, 0, 'no continuation is counted as sent');
+}));
+
+test('T30 the loader decodes three stored logs at once instead of one after another', () => clocked(async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const sessions = ['a', 'b', 'c', 'd', 'e'].map((id) => record(id, log(OPEN())));
+  const { host, store } = scenario({ sessions, readGate: gate });
+  host.start();
+  await settle();
+
+  assert.equal(store.state.reads, 3, 'three log reads start before the first one settles');
+  release();
+  await settle();
+  await settle();
+
+  assert.equal(store.state.reads, 5, 'the remaining two follow the first three');
+  assert.equal(store.state.opens.length, 5, 'every stored log is still read');
 }));

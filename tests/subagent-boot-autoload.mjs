@@ -129,7 +129,7 @@ const hosts = [];
  * the plugin made, recorded before any check. A followup queues into the inbox, as the driver does. `resumeDelay` holds
  * one id-to-milliseconds map, so a boot resume can outlive the caller's 10 s call timeout as a stalled host resume does.
  */
-function scenario({ sessions = [], live = [], overrides = {}, parent = true, archived = [], subagents = true, sendFailure, capacity, occupied = [], hang = false, closerView = false, resumeDelay = {} } = {}) {
+function scenario({ sessions = [], live = [], overrides = {}, parent = true, archived = [], subagents = true, sendFailure, capacity, occupied = [], hang = false, closerView = false, resumeDelay = {}, resumeFailure = {} } = {}) {
   const records = new Map(sessions.map((item) => [item.header.id, item]));
   const resumes = [];
   const pluginResumes = [];
@@ -168,6 +168,9 @@ function scenario({ sessions = [], live = [], overrides = {}, parent = true, arc
     resumes.push(options);
     const delay = resumeDelay[options.resumeSessionId];
     if (delay !== undefined) await new Promise((resolve) => setTimeout(resolve, delay));
+    // A host refusal of one resume (the real host rejects a resume its persistence or setup refuses). Nothing is published.
+    const failure = resumeFailure[options.resumeSessionId];
+    if (failure !== undefined) throw failure;
     if (options.setup !== undefined) await options.setup({ calls: [] }, undefined);
     return openSession(options);
   };
@@ -1706,6 +1709,243 @@ test('PARENT-6 dispose drops a child still waiting for its parent, and the drop 
     await afterImmediate();
     await settle();
     assert.equal(sends.length, 0, 'no delivery after dispose');
+  } finally {
+    cap.restore();
+  }
+}));
+
+// ===== Round 7 (ticket 01): the recovery loads a child's parent, which no other boot path loads =====
+// The defect this closes: a parent whose own last turn completed is not listed by the boot scan (persistedLastActivity
+// refuses a completed turn), so nothing ever resumes it. The child's delivery then finds no live sender, waits for a
+// parent no path loads, and is dropped when the window closes. The delivery now loads that parent itself, on the route
+// and preset from the parent's own log, and continues the child in the same boot.
+
+/** A parent session that finished its last turn, so the stored scan never lists it. */
+const COMPLETED_PARENT = (route = { provider: 'deepseek', model: 'parent-model' }) => [
+  routeHeader(route), turnStart(1), userPrompt(), turnEnd(1, { kind: 'completed' }),
+];
+
+/**
+ * Record every preset the plugin mounts. The fake host's resume runs the plugin's setup but discards the agent context
+ * it passes, so the mount call itself is what shows which preset the load composed.
+ */
+function spyMounts(services) {
+  const mounts = [];
+  const mount = services.agentPresets.mount;
+  services.agentPresets.mount = async (agentCtx, id) => {
+    mounts.push({ id, agentCtx });
+    return mount(agentCtx, id);
+  };
+  return mounts;
+}
+
+const parentLoadLines = (lines) => lines.filter((line) => line.includes('loaded parent') || line.includes('failed to load parent'));
+
+test('LOAD-1 a completed parent is loaded on the route and preset from its own log, and the child is continued in the same boot', () => clocked(async () => {
+  const cap = captureLogLines();
+  try {
+    const { host, sends, pluginResumes, services } = scenario({
+      parent: false,
+      overrides: { verbose: true },
+      sessions: [
+        record('kid', log(CHILD_OPEN()), { delegationDepth: 1 }),
+        record('parent', log(COMPLETED_PARENT()), { origin: undefined, parentSession: undefined, agentPreset: 'planner' }),
+      ],
+    });
+    const mounts = spyMounts(services);
+    host.start();
+    await settle();
+    await nextPass();
+    assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), ['parent'], 'the parent is resumed once, through ctx.agents.resume');
+    assert.deepEqual(pluginResumes[0].agentOptions, { provider: 'deepseek', model: 'parent-model' },
+      'the route comes from the parent own log, not from the default selection');
+    assert.equal(typeof pluginResumes[0].setup, 'function', 'the plugin composes the parent through its own setup');
+    assert.deepEqual(mounts.map((mount) => mount.id), ['planner'], 'the preset recorded by the parent is mounted');
+    assert.equal(sends.length, 1, 'the child Continue is delivered in the same boot');
+    assert.equal(sends[0].targetId, 'kid');
+    assert.equal(sends[0].sender, host.agents.get('parent'), 'the sender is the parent this load published');
+    assert.deepEqual(sentTexts(host.agents.get('kid')), ['Continue']);
+    assert.equal(host.listenerCount('agent/created'), 0, 'a loaded parent leaves no wait behind');
+    assert.ok(cap.lines.some((line) => line.includes('loaded parent parent for child kid')),
+      `the load is logged with the parent and the child; got ${JSON.stringify(cap.lines)}`);
+    assert.ok(cap.lines.some((line) => line.includes('continued child kid')), 'the delivery is logged too');
+    await nextPass();
+    assert.equal(pluginResumes.length, 1, 'the parent is loaded once, not once per pass');
+    assert.equal(sends.length, 1);
+  } finally {
+    cap.restore();
+  }
+}));
+
+test('LOAD-2 a parent whose log records no route is loaded on the default selection', () => clocked(async () => {
+  const { host, sends, pluginResumes } = scenario({
+    parent: false,
+    sessions: [
+      record('kid', log(CHILD_OPEN()), { delegationDepth: 1 }),
+      record('parent', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'completed' })]),
+        { origin: undefined, parentSession: undefined }),
+    ],
+  });
+  host.start();
+  await settle();
+  await nextPass();
+  assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), ['parent']);
+  assert.deepEqual(pluginResumes[0].agentOptions, { provider: 'dp', model: 'dm' },
+    'without a logged route the host default selection applies, as it does for a user session');
+  assert.equal(sends.length, 1, 'the child is continued in the same boot');
+  assert.equal(sends[0].sender, host.agents.get('parent'));
+}));
+
+test('LOAD-3 a parent that is itself a subagent is loaded through the same resume call, never through the child path', () => clocked(async () => {
+  const { host, sends, pluginResumes, services } = scenario({
+    parent: false,
+    sessions: [
+      record('kid', log(CHILD_OPEN()), { delegationDepth: 2 }),
+      record('parent', log([
+        routeHeader({ provider: 'deepseek', model: 'nested-model' }), turnStart(1), userPrompt(),
+        turnEnd(1, { kind: 'completed' }),
+        { type: 'agent-preset/selected', data: { agentPreset: 'reviewer' } },
+      ]), { parentSession: 'grandparent', delegationDepth: 1 }),
+    ],
+  });
+  const mounts = spyMounts(services);
+  host.start();
+  await settle();
+  await nextPass();
+  assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), ['parent'], 'a nested parent resumes as a session');
+  assert.deepEqual(pluginResumes[0].agentOptions, { provider: 'deepseek', model: 'nested-model' });
+  assert.ok(pluginResumes[0].setup !== undefined, 'the plugin mounts the preset, not the host cold resume');
+  assert.deepEqual(mounts.map((mount) => mount.id), ['reviewer'], 'the preset its own log selected is mounted');
+  assert.ok(sends.every((send) => send.targetId === 'kid'), 'the parent is never sent a Continue');
+  assert.equal(sends.length, 1, 'the child is continued under the loaded parent');
+  assert.equal(sends[0].sender, host.agents.get('parent'));
+}));
+
+test('LOAD-4 a parent load the host refuses keeps the wait, logs the child and the failure, and delivers when the parent appears', () => clocked(async () => {
+  const cap = captureLogLines();
+  try {
+    const { host, sends, pluginResumes } = scenario({
+      parent: false,
+      resumeFailure: { parent: new Error('the host refused the resume') },
+      sessions: [
+        record('kid', log(CHILD_OPEN()), { delegationDepth: 1 }),
+        record('parent', log(COMPLETED_PARENT()), { origin: undefined, parentSession: undefined }),
+      ],
+    });
+    host.start();
+    await settle();
+    await nextPass();
+    assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), ['parent'], 'the load is attempted once');
+    assert.equal(sends.length, 0, 'nothing is delivered while the parent is not live');
+    assert.equal(host.listenerCount('agent/created'), 1, 'the child keeps today wait');
+    assert.ok(cap.lines.some((line) => line.includes('failed to load parent parent for child kid: the host refused the resume')),
+      `the failure names the parent, the child and the failure; got ${JSON.stringify(cap.lines)}`);
+    assert.ok(!cap.lines.some((line) => line.includes('loaded parent')), 'no load is reported');
+    // The parent becomes live another way: the retained wait delivers the child exactly as before.
+    publishParent(host);
+    await afterImmediate();
+    await settle();
+    assert.equal(sends.length, 1, 'the waiting child is continued once the parent is live');
+    assert.equal(sends[0].sender, host.agents.get('parent'));
+    assert.deepEqual(sentTexts(host.agents.get('kid')), ['Continue']);
+  } finally {
+    cap.restore();
+  }
+}));
+
+test('LOAD-5 an archived or unknown parent is skipped at once: no load and no wait', () => clocked(async () => {
+  const archivedKin = scenario({ parent: false, archived: ['parent'], sessions: [record('kin', log(CHILD_OPEN()))] });
+  archivedKin.host.start();
+  await settle();
+  await nextPass();
+  assert.equal(archivedKin.pluginResumes.length, 0, 'an archived parent is never loaded');
+  assert.equal(archivedKin.sends.length, 0);
+  assert.equal(archivedKin.host.listenerCount('agent/created'), 0, 'an archived parent never enters the wait');
+  archivedKin.host.dispose();
+  const unknown = scenario({ parent: false, sessions: [record('orphan', log(CHILD_OPEN()), { parentSession: undefined })] });
+  unknown.host.start();
+  await settle();
+  await nextPass();
+  assert.equal(unknown.pluginResumes.length, 0, 'a child with no parent session has no parent to load');
+  assert.equal(unknown.sends.length, 0);
+  assert.equal(unknown.host.listenerCount('agent/created'), 0, 'no wait is registered for an unknown parent');
+}));
+
+test('LOAD-6 a paused parent is never loaded, and the child keeps today wait and delivery', () => clocked(async () => {
+  const cap = captureLogLines();
+  try {
+    const { host, sends, pluginResumes } = scenario({
+      parent: false,
+      overrides: { sessionModes: { parent: 'off' } },
+      sessions: [
+        record('kid', log(CHILD_OPEN()), { delegationDepth: 1 }),
+        record('parent', log(COMPLETED_PARENT()), { origin: undefined, parentSession: undefined }),
+      ],
+    });
+    host.start();
+    await settle();
+    await nextPass();
+    assert.equal(pluginResumes.length, 0, 'a parent the operator paused is never loaded');
+    assert.equal(sends.length, 0);
+    assert.equal(host.listenerCount('agent/created'), 1, 'the child waits as it does today');
+    assert.ok(parentLoadLines(cap.lines).some((line) => line.includes('failed to load parent parent for child kid') && line.includes('paused')),
+      `the refusal names the reason; got ${JSON.stringify(cap.lines)}`);
+    // A parent that becomes live by another route still receives today's delivery.
+    publishParent(host);
+    await afterImmediate();
+    await settle();
+    assert.equal(sends.length, 1, 'today delivery applies once the parent is live');
+    assert.deepEqual(sentTexts(host.agents.get('kid')), ['Continue']);
+  } finally {
+    cap.restore();
+  }
+}));
+
+test('LOAD-7 a parent load that settles after the boot deadline is disposed, not continued', () => clocked(async () => {
+  const cap = captureLogLines();
+  try {
+    const { host, sends, pluginResumes } = scenario({
+      parent: false,
+      // The window closes at 3 s; the resume settles at 5 s, inside the 10 s call timeout, so its handle does arrive.
+      overrides: { freshMs: 3000 },
+      resumeDelay: { parent: 5000 },
+      sessions: [
+        record('kid', log(CHILD_OPEN()), { delegationDepth: 1 }),
+        record('parent', log(COMPLETED_PARENT()), { origin: undefined, parentSession: undefined }),
+      ],
+    });
+    host.start();
+    await settle();
+    assert.deepEqual(pluginResumes.map((options) => options.resumeSessionId), ['parent'], 'the load starts inside the window');
+    await settle(3000);
+    assert.equal(host.agents.get('parent'), undefined, 'the parent has not settled at the deadline');
+    await settle(2000);
+    assert.equal(host.agents.get('parent'), undefined, 'the late parent handle is disposed instead of kept');
+    assert.equal(sends.length, 0, 'the child is not continued');
+    assert.equal(host.agents.get('kid'), undefined, 'the child stays unloaded');
+    assert.ok(!cap.lines.some((line) => line.includes('loaded parent')), 'no load is reported');
+    assert.ok(cap.lines.some((line) => line.includes('failed to load parent parent for child kid') && line.includes('boot window')),
+      `the late load is logged as a failure; got ${JSON.stringify(cap.lines)}`);
+  } finally {
+    cap.restore();
+  }
+}));
+
+test('LOAD-8 a live parent keeps the existing path: no parent load, no parent-load record, the same continued child line', () => clocked(async () => {
+  const cap = captureLogLines();
+  try {
+    const { host, sends, pluginResumes } = scenario({
+      overrides: { verbose: true },
+      sessions: [record('kid', log(CHILD_OPEN()))],
+    });
+    host.start();
+    await settle();
+    await nextPass();
+    assert.equal(pluginResumes.length, 0, 'a live parent is never resumed');
+    assert.equal(sends.length, 1, 'the child is continued through the existing path');
+    assert.deepEqual(sentTexts(host.agents.get('kid')), ['Continue']);
+    assert.equal(parentLoadLines(cap.lines).length, 0, `no parent-load record is emitted; got ${JSON.stringify(cap.lines)}`);
+    assert.ok(cap.lines.some((line) => line.includes('continued child kid')), 'the existing continued child record stays');
   } finally {
     cap.restore();
   }

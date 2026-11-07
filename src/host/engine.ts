@@ -371,6 +371,7 @@ interface PersistedStore {
    */
   stat?(id: SessionId): Promise<{ readonly revision?: unknown } | undefined>;
   open(id: SessionId, access: 'read'): Promise<{
+    readonly header: PersistedHeader;
     readonly inheritedEventCount: number;
     read(offset?: number): Promise<{ readonly events: readonly SessionEvent[] }>;
     close(): Promise<void>;
@@ -2517,8 +2518,9 @@ export class AutoContinueRunner {
    * child's activation, so the child reaches its parent and the parent's messages reach the child. The plugin keeps no
    * handle to the child. The child is continued only on the route it pins, and only when its own log shows that route.
    * It is continued at most once per host process. A refusal at the active-child limit delivers nothing, so the child
-   * waits for a slot (see waitForSlot). A parent that a boot pass resumes but has not published yet delivers nothing
-   * either, so the child waits for that parent (see deferForParent). A refusal because the child became resident
+   * waits for a slot (see waitForSlot). A parent that is not live is loaded by the delivery itself (loadParent); when
+   * that load fails, is refused, or is still pending, nothing is delivered and the child waits for the parent (see
+   * deferForParent). A refusal because the child became resident
    * meanwhile (skipIfResident) also
    * delivers nothing. A child that started a turn after the listing (skipIfRunSince) is not sent Continue. Any other failure is not retried in this run. A timed-out delivery is retried once (F-4).
    */
@@ -2541,12 +2543,16 @@ export class AutoContinueRunner {
       this.log(`skip ${entry.id}: the parent is archived or unknown, so the child is not continued`);
       return;
     }
-    // The host sends only from the exact live sender agent, so the parent must be live under the same id. This boot pass
-    // resumes parents itself, so a parent that is not live yet may be published moments later: the child waits for it
-    // instead of being dropped for the whole run (deferForParent). An archived or unknown parent was skipped above and
-    // never reaches the wait.
-    const parent = this.ctx.agents.get(parentSession);
-    if (parent === undefined || parent.id !== parentSession) {
+    // The host sends only from the exact live sender agent, so the parent must be live under the same id. A parent
+    // whose own last turn completed is listed by no boot path, so nothing else resumes it: this delivery loads it and
+    // the child is continued in the same boot. A load that fails, is refused, or settles after the window keeps today's
+    // behavior: the child waits for the parent to become live another way (deferForParent). An archived or unknown
+    // parent was skipped above and never reaches the wait.
+    const live = this.ctx.agents.get(parentSession);
+    const parent = live !== undefined && live.id === parentSession
+      ? live
+      : await this.loadParent(parentSession, entry.id);
+    if (parent === undefined) {
       this.deferForParent(entry, child, parentSession);
       return;
     }
@@ -2608,6 +2614,89 @@ export class AutoContinueRunner {
     }
     this.log(`continued child ${entry.id} through the subagent service (message ${String(messageId)})`);
     this.noteSlotRelease();
+  }
+
+  /**
+   * Load a child's parent session that no other boot path loads: the parent's own last turn completed, so the stored
+   * scan never lists it, and the delivery above would otherwise wait for a session nothing resumes. The route and preset
+   * come from the parent's own log, so it comes back on what it last ran on; the default selection applies only when the
+   * log records no route, exactly as for a user session (resumeEntry). The call is the same one resumeEntry makes, so a
+   * parent that is itself a subagent is resumed as a session and never through the child path, and its preset is mounted
+   * by this plugin's own setup rather than by the host's cold resume. The load is claimed through the boot claim set, so
+   * one boot never resumes a session twice, and bounded by the boot deadline: nothing starts after it, and a handle that
+   * settles after it is disposed instead of used. Returns the live parent, or undefined after logging why, so the caller
+   * keeps today's wait for a parent that may still become live another way.
+   */
+  private async loadParent(parentSession: SessionId, childSession: SessionId): Promise<Agent | undefined> {
+    const failed = (failure: unknown): undefined => {
+      console.error(
+        `[auto-continue] failed to load parent ${parentSession} for child ${childSession}: ${
+          failure instanceof Error ? failure.message : String(failure)
+        }`,
+      );
+      return undefined;
+    };
+    try {
+      // The operator closed this session (mode off) or paused everything: nothing opens it.
+      if (this.sessionConfig(parentSession).paused) return failed('the parent session is paused');
+      if (!this.persistedOpen()) return failed('the boot window has ended');
+      const persistence = this.ctx.get('sessionPersistence') as PersistedStore | undefined;
+      if (persistence === undefined) return failed('the persistence service is not available');
+      const opening = persistence.open(parentSession, 'read');
+      const stored = await withPersistedTimeout(opening).catch((error: unknown) => {
+        // A late open still returns a tracked read handle; close it rather than leave it open.
+        void opening.then((late) => late.close()).catch(() => undefined);
+        throw error;
+      });
+      let route: PersistedRoute | undefined;
+      let preset: string | undefined;
+      try {
+        const { events } = await withPersistedTimeout(stored.read(0));
+        // An inherited prefix is not this parent's own history, so its route is the one its own turns ran on.
+        const inherited = stored.header.origin === 'subagent' ? stored.inheritedEventCount : 0;
+        route = persistedRoute(inherited > 0 ? events.slice(inherited) : events);
+        preset = persistedPreset(stored.header, events);
+      } finally {
+        await withPersistedTimeout(stored.close()).catch(() => undefined);
+      }
+      const defaults = this.ctx.get('agentDefaultModel') as { currentSelection(): PersistedRoute } | undefined;
+      const chosen = route ?? defaults?.currentSelection();
+      if (chosen === undefined) return failed('the parent log records no route, and the host has no default model');
+      const presets = this.ctx.get('agentPresets') as PersistedPresets | undefined;
+      let setup: ((agentCtx: Context) => Promise<void>) | undefined;
+      if (presets !== undefined) {
+        const presetId = (await presets.resolve(preset)).id;
+        setup = async (agentCtx) => {
+          await presets.mount(agentCtx, presetId);
+        };
+      }
+      // Archive and window are re-checked after the last await, right before the host call.
+      const registry = this.ctx.get('workspaceRegistry') as PersistedRegistry | undefined;
+      if (registry === undefined || registry.archivedSessionIds.includes(parentSession)) {
+        return failed('the parent session is archived');
+      }
+      if (!this.persistedOpen()) return failed('the boot window has ended');
+      // Checked and claimed in the same tick as the host call. A parent that became live during the reads above is used
+      // by the wait fallback at once (deferForParent attempts immediately), and a claim from the stored sweep or the
+      // loader means this boot already resumes it; either way this path starts nothing.
+      if (this.ctx.agents.get(parentSession) !== undefined || !this.claimBootResume(parentSession)) {
+        return failed('the parent is already live or resumed in this boot');
+      }
+      const resumed = await this.resumeClaimed(parentSession, () => this.ctx.agents.resume({
+        resumeSessionId: parentSession,
+        agentOptions: { provider: chosen.provider, model: chosen.model },
+        setup,
+      }));
+      if (Date.now() >= this.bootDeadline) {
+        // The host published the parent, but the window closed first. Release it; it is never used.
+        void resumed.dispose().catch(reportLoaderError);
+        return failed('the parent load settled after the boot window closed');
+      }
+      console.info(`[auto-continue] loaded parent ${parentSession} for child ${childSession}`);
+      return resumed.agent;
+    } catch (error) {
+      return failed(error);
+    }
   }
 
   /**
@@ -2686,9 +2775,10 @@ export class AutoContinueRunner {
   }
 
   /**
-   * Keep a child whose parent this boot pass may still publish. The boot scan resumes a parent through ctx.agents.resume,
-   * and the host announces a resumed agent with agent/created (dsh-agent/lib/index.js:announce) on the same scope carrier
-   * the agent/disposed listener already uses. The child waits in the same set a child refused at the active-child limit
+   * Keep a child whose parent this boot pass may still publish: its own load (loadParent) can be pending, refused, or
+   * failed, and a parent the stored sweep or another pass resumes is published moments later. The host announces a
+   * resumed agent with agent/created (dsh-agent/lib/index.js:announce) on the same scope carrier the agent/disposed
+   * listener already uses. The child waits in the same set a child refused at the active-child limit
    * uses, under the same boot-window timer, so a parent that never becomes live holds neither a listener nor a timer past
    * the window. The child is not in the once-set, so the retry may still deliver it.
    */

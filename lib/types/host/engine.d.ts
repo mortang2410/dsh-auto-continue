@@ -318,14 +318,27 @@ export declare class AutoContinueRunner {
      * child's activation, so the child reaches its parent and the parent's messages reach the child. The plugin keeps no
      * handle to the child. The child is continued only on the route it pins, and only when its own log shows that route.
      * It is continued at most once per host process. A refusal at the active-child limit delivers nothing, so the child
-     * waits for a slot (see waitForSlot). A parent that a boot pass resumes but has not published yet delivers nothing
-     * either, so the child waits for that parent (see deferForParent). A refusal because the child became resident
+     * waits for a slot (see waitForSlot). A parent that is not live is loaded by the delivery itself (loadParent); when
+     * that load fails, is refused, or is still pending, nothing is delivered and the child waits for the parent (see
+     * deferForParent). A refusal because the child became resident
      * meanwhile (skipIfResident) also
      * delivers nothing. A child that started a turn after the listing (skipIfRunSince) is not sent Continue. Any other failure is not retried in this run. A timed-out delivery is retried once (F-4).
      */
     private continueChild;
     /** The body of continueChild. Every return path reaches its finally, so an idle wait ends there. */
     private deliverChild;
+    /**
+     * Load a child's parent session that no other boot path loads: the parent's own last turn completed, so the stored
+     * scan never lists it, and the delivery above would otherwise wait for a session nothing resumes. The route and preset
+     * come from the parent's own log, so it comes back on what it last ran on; the default selection applies only when the
+     * log records no route, exactly as for a user session (resumeEntry). The call is the same one resumeEntry makes, so a
+     * parent that is itself a subagent is resumed as a session and never through the child path, and its preset is mounted
+     * by this plugin's own setup rather than by the host's cold resume. The load is claimed through the boot claim set, so
+     * one boot never resumes a session twice, and bounded by the boot deadline: nothing starts after it, and a handle that
+     * settles after it is disposed instead of used. Returns the live parent, or undefined after logging why, so the caller
+     * keeps today's wait for a parent that may still become live another way.
+     */
+    private loadParent;
     /**
      * One Continue call under the call timeout. Each call has its own abort signal, so a timed-out call is aborted and admits
      * nothing. `onTimeout` runs synchronously when the call times out, before the outer wait can settle.
@@ -350,9 +363,10 @@ export declare class AutoContinueRunner {
      */
     private waitForSlot;
     /**
-     * Keep a child whose parent this boot pass may still publish. The boot scan resumes a parent through ctx.agents.resume,
-     * and the host announces a resumed agent with agent/created (dsh-agent/lib/index.js:announce) on the same scope carrier
-     * the agent/disposed listener already uses. The child waits in the same set a child refused at the active-child limit
+     * Keep a child whose parent this boot pass may still publish: its own load (loadParent) can be pending, refused, or
+     * failed, and a parent the stored sweep or another pass resumes is published moments later. The host announces a
+     * resumed agent with agent/created (dsh-agent/lib/index.js:announce) on the same scope carrier the agent/disposed
+     * listener already uses. The child waits in the same set a child refused at the active-child limit
      * uses, under the same boot-window timer, so a parent that never becomes live holds neither a listener nor a timer past
      * the window. The child is not in the once-set, so the retry may still deliver it.
      */

@@ -581,14 +581,6 @@ function persistedChildDescriptor(
 /** Hard limit on one host call the boot loader makes (list, open, read, close, resume). Not configurable. */
 const PERSISTED_CALL_TIMEOUT_MS = 10_000;
 
-/**
- * How many stored logs the boot loader decodes at once. Each open parses one whole log: the store decompresses it on the
- * libuv thread pool, so a second and third open overlap that work instead of queueing behind it. Three is the cap
- * because a large log expands to hundreds of megabytes while it is held, and opening the whole store at once would
- * trade a slow boot window for a memory spike. Not configurable.
- */
-const PERSISTED_READ_CONCURRENCY = 3;
-
 /** A host call the boot loader stopped waiting for. The call itself may still settle later. */
 class PersistedCallTimeout extends Error {}
 
@@ -2307,7 +2299,6 @@ export class AutoContinueRunner {
     // resuming that root a second time.
     const sweepOwnsRoots = this.ctx.get('sessionQuery') !== undefined;
     const rejections = this.loadPersistedRejections();
-    const candidates: PersistedHeader[] = [];
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
@@ -2320,54 +2311,13 @@ export class AutoContinueRunner {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined && rejections.get(header.id) === revision) continue;
       }
-      candidates.push(header);
+      const entry = await this.readPersistedEntry(persistence, header, now, config);
+      if (entry !== undefined) queue.push(entry);
     }
-    // Decoded a few at a time instead of one after another: a store of four thousand logs took two minutes this way.
-    // Results keep listing order, so the queue stays deterministic for equal depth and activity.
-    const entries = await this.readPersistedEntries(persistence, candidates, now, config);
-    // A pass the boot window cut short installs nothing, the way the serial loop returned before finalizing.
-    if (entries === undefined) return;
-    for (const entry of entries) if (entry !== undefined) queue.push(entry);
     // Shallower sessions first, so a child's live parent is resumed before the child (resumeEntry needs it live).
     queue.sort((left, right) => left.depth - right.depth || right.lastActivityAt - left.lastActivityAt);
     this.persistedQueue = queue;
     this.persistedEnumerated = true;
-  }
-
-  /**
-   * Read up to PERSISTED_READ_CONCURRENCY stored logs at once, in listing order. A session that went live while the
-   * pass ran is skipped rather than queued twice, and the boot window is rechecked before every open.
-   */
-  private async readPersistedEntries(
-    persistence: PersistedStore,
-    headers: readonly PersistedHeader[],
-    now: number,
-    config: AutoContinueConfig,
-  ): Promise<readonly (PersistedEntry | undefined)[] | undefined> {
-    const entries: (PersistedEntry | undefined)[] = Array.from({ length: headers.length });
-    let next = 0;
-    let stopped = false;
-    const worker = async (): Promise<void> => {
-      while (true) {
-        if (!this.persistedOpen()) {
-          stopped = true;
-          return;
-        }
-        const index = next;
-        next += 1;
-        const header = headers[index];
-        if (header === undefined) return;
-        if (this.ctx.agents.get(header.id) !== undefined) continue;
-        entries[index] = await this.readPersistedEntry(persistence, header, now, config);
-      }
-    };
-    const width = Math.min(PERSISTED_READ_CONCURRENCY, headers.length);
-    const workers: Promise<void>[] = [];
-    for (let started = 0; started < width; started += 1) workers.push(worker());
-    await Promise.all(workers);
-    // Undefined when the window cut the pass short with rows still unread, so the caller can skip the queue it never
-    // finished. A pass that stopped just after its last row still returns its rows.
-    return stopped && next < headers.length ? undefined : entries;
   }
 
   /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */

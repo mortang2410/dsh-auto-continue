@@ -301,11 +301,6 @@ export declare class AutoContinueRunner {
      * flight and is awaited again rather than repeated, so at most one list() is in flight.
      */
     private enumeratePersisted;
-    /**
-     * Read up to PERSISTED_READ_CONCURRENCY stored logs at once, in listing order. A session that went live while the
-     * pass ran is skipped rather than queued twice, and the boot window is rechecked before every open.
-     */
-    private readPersistedEntries;
     /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */
     private resumeQueuedPersisted;
     /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an

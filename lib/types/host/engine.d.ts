@@ -87,6 +87,12 @@ export declare class AutoContinueRunner {
     /** Persisted sessions are enumerated once per boot, after the service is available. */
     private persistedEnumerated;
     private readonly persistedDecided;
+    /**
+     * Session id to the artifact revision that failed to read, kept across restarts so a boot does not decode a log it
+     * has already rejected. A repaired artifact has a new revision and is read again.
+     */
+    private persistedRejections;
+    private persistedRejectionSave;
     /** Eligible persisted sessions not yet resumed, newest activity first. */
     private persistedQueue;
     /** The single in-flight list() call. A stalled call is awaited again on later passes, never repeated. */
@@ -272,13 +278,25 @@ export declare class AutoContinueRunner {
     /** One background pass: enumerate once after the services exist, then resume queued sessions within scanLimit. */
     private runPersisted;
     /**
+     * Where the rejection record lives: the composed profile home when one exists, else the default DSH home.
+     */
+    private persistedRejectionPath;
+    /** Load the rejection record once per process. An unreadable record is ignored, never fatal. */
+    private loadPersistedRejections;
+    /** Persist the rejection record, coalescing bursts so one boot writes once. */
+    private schedulePersistedRejectionSave;
+    private savePersistedRejections;
+    /** The artifact's own revision, or undefined when the backend cannot report one cheaply. */
+    private persistedRevision;
+    /**
      * Enumerate once. A rejected or stalled list() leaves enumeration for a later pass. A stalled call stays in
      * flight and is awaited again rather than repeated, so at most one list() is in flight.
      */
     private enumeratePersisted;
     /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */
     private resumeQueuedPersisted;
-    /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped. */
+    /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an
+     * unreadable one at a known revision is remembered so the next boot skips it without decoding it again. */
     private readPersistedEntry;
     /** Resume one persisted session through the host. A failure or stall drops it for this boot; only a boot Continue is retried (deliverChild). */
     private resumePersisted;

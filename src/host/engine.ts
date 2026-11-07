@@ -14,6 +14,9 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent';
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types';
@@ -361,6 +364,11 @@ interface PersistedHeader {
 
 interface PersistedStore {
   list(): Promise<readonly { readonly header: PersistedHeader }[]>;
+  /**
+   * Cheap identity of the stored artifact, without decoding it. Present on the JSONL backend, where the revision is
+   * derived from the file's own size and timestamps, so a changed file yields a changed revision.
+   */
+  stat?(id: SessionId): Promise<{ readonly revision?: unknown } | undefined>;
   open(id: SessionId, access: 'read'): Promise<{
     readonly inheritedEventCount: number;
     read(offset?: number): Promise<{ readonly events: readonly SessionEvent[] }>;
@@ -371,6 +379,11 @@ interface PersistedStore {
 interface PersistedRegistry {
   readonly archivedSessionIds: readonly SessionId[];
 }
+
+/** Shape version of the persisted rejection record. A different version is ignored rather than misread. */
+const PERSISTED_REJECTION_VERSION = 1;
+/** Upper bound on remembered rejections, so the record cannot grow without limit on a large store. */
+const PERSISTED_REJECTION_MAX = 5_000;
 
 interface PersistedPresets {
   resolve(id?: string): Promise<{ readonly id: string }>;
@@ -728,6 +741,12 @@ export class AutoContinueRunner {
   /** Persisted sessions are enumerated once per boot, after the service is available. */
   private persistedEnumerated = false;
   private readonly persistedDecided = new Set<SessionId>();
+  /**
+   * Session id to the artifact revision that failed to read, kept across restarts so a boot does not decode a log it
+   * has already rejected. A repaired artifact has a new revision and is read again.
+   */
+  private persistedRejections: Map<string, string> | undefined;
+  private persistedRejectionSave: ReturnType<typeof setTimeout> | undefined;
   /** Eligible persisted sessions not yet resumed, newest activity first. */
   private persistedQueue: PersistedEntry[] = [];
   /** The single in-flight list() call. A stalled call is awaited again on later passes, never repeated. */
@@ -2156,6 +2175,78 @@ export class AutoContinueRunner {
   }
 
   /**
+   * Where the rejection record lives: the composed profile home when one exists, else the default DSH home.
+   */
+  private persistedRejectionPath(): string {
+    const profile = this.ctx.get('profileContext') as { readonly home?: unknown } | undefined;
+    const home = typeof profile?.home === 'string' && profile.home !== '' ? profile.home : join(homedir(), '.dsh');
+    return join(home, 'auto-continue-rejections.json');
+  }
+
+  /** Load the rejection record once per process. An unreadable record is ignored, never fatal. */
+  private async loadPersistedRejections(): Promise<Map<string, string>> {
+    const cached = this.persistedRejections;
+    if (cached !== undefined) return cached;
+    const record = new Map<string, string>();
+    try {
+      const raw = await readFile(this.persistedRejectionPath(), 'utf8');
+      const parsed = JSON.parse(raw) as { readonly version?: unknown; readonly entries?: unknown };
+      if (parsed.version === PERSISTED_REJECTION_VERSION && parsed.entries !== null && typeof parsed.entries === 'object') {
+        for (const [id, revision] of Object.entries(parsed.entries as Record<string, unknown>)) {
+          if (typeof revision === 'string' && revision !== '') record.set(id, revision);
+        }
+      }
+    } catch (error) {
+      if ((error as { readonly code?: unknown } | null)?.code !== 'ENOENT') {
+        this.log(`读取失败会话记录出错, 本次启动忽略: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    this.persistedRejections = record;
+    return record;
+  }
+
+  /** Persist the rejection record, coalescing bursts so one boot writes once. */
+  private schedulePersistedRejectionSave(): void {
+    if (this.persistedRejectionSave !== undefined) return;
+    this.persistedRejectionSave = setTimeout(() => {
+      this.persistedRejectionSave = undefined;
+      void this.savePersistedRejections();
+    }, 2_000);
+  }
+
+  private async savePersistedRejections(): Promise<void> {
+    const record = this.persistedRejections;
+    if (record === undefined) return;
+    const entries: Record<string, string> = {};
+    let kept = 0;
+    for (const [id, revision] of record) {
+      if (kept >= PERSISTED_REJECTION_MAX) break;
+      entries[id] = revision;
+      kept += 1;
+    }
+    const path = this.persistedRejectionPath();
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, `${JSON.stringify({ version: PERSISTED_REJECTION_VERSION, entries })}\n`, 'utf8');
+    } catch (error) {
+      this.log(`写入失败会话记录出错: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** The artifact's own revision, or undefined when the backend cannot report one cheaply. */
+  private async persistedRevision(persistence: PersistedStore, id: SessionId): Promise<string | undefined> {
+    const stat = persistence.stat;
+    if (stat === undefined) return undefined;
+    try {
+      const observed = await withPersistedTimeout(stat.call(persistence, id));
+      const revision = observed?.revision;
+      return revision === undefined || revision === null ? undefined : String(revision);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Enumerate once. A rejected or stalled list() leaves enumeration for a later pass. A stalled call stays in
    * flight and is awaited again rather than repeated, so at most one list() is in flight.
    */
@@ -2182,12 +2273,17 @@ export class AutoContinueRunner {
     // If sessionQuery registers after this read, the loader may already own a root; bootResumeClaims keeps the sweep from
     // resuming that root a second time.
     const sweepOwnsRoots = this.ctx.get('sessionQuery') !== undefined;
+    const rejections = await this.loadPersistedRejections();
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
-      const entry = await this.readPersistedEntry(persistence, header, now, config);
+      // A log this scan already rejected is skipped without decoding it, but only while the artifact is unchanged:
+      // a repaired file has a new revision and gets a fresh attempt.
+      const revision = await this.persistedRevision(persistence, header.id);
+      if (revision !== undefined && rejections.get(header.id) === revision) continue;
+      const entry = await this.readPersistedEntry(persistence, header, now, config, revision);
       if (entry !== undefined) queue.push(entry);
     }
     // Shallower sessions first, so a child's live parent is resumed before the child (resumeEntry needs it live).
@@ -2209,12 +2305,14 @@ export class AutoContinueRunner {
     }
   }
 
-  /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped. */
+  /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an
+   * unreadable one at a known revision is remembered so the next boot skips it without decoding it again. */
   private async readPersistedEntry(
     persistence: PersistedStore,
     header: PersistedHeader,
     now: number,
     config: AutoContinueConfig,
+    revision?: string,
   ): Promise<PersistedEntry | undefined> {
     try {
       const opening = persistence.open(header.id, 'read');
@@ -2277,6 +2375,11 @@ export class AutoContinueRunner {
           this.notifySpiralStopped(header.id, config);
           return undefined;
         }
+        if (revision !== undefined) {
+          // The same artifact now reads cleanly, so any older rejection of it is stale.
+          const rejections = await this.loadPersistedRejections();
+          if (rejections.delete(header.id)) this.schedulePersistedRejectionSave();
+        }
         return {
           id: header.id,
           lastActivityAt,
@@ -2290,6 +2393,12 @@ export class AutoContinueRunner {
         await withPersistedTimeout(handle.close()).catch(() => undefined);
       }
     } catch (error) {
+      // A stall is a property of this boot, not of the log, so only a real read failure is remembered.
+      if (revision !== undefined && !(error instanceof PersistedCallTimeout)) {
+        const rejections = await this.loadPersistedRejections();
+        rejections.set(header.id, revision);
+        this.schedulePersistedRejectionSave();
+      }
       console.error(`[auto-continue] 跳过无法读取的持久化会话 ${header.id}: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;
     }

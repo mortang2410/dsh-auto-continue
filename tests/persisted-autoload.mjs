@@ -1015,3 +1015,44 @@ test('T37 a row another host writes after this one loaded survives the save', ()
   assert.fail('the merged record never held both rows');
 })));
 
+/**
+ * T38: a child with no parent can never be continued, so its own log settles the refusal and the next boot does not
+ * decode it again. Two boots share one DSH_HOME on purpose, so the record the first writes is what the second reads.
+ */
+test('T38 a parentless child is settled by one read, so the second boot spends no decode on it', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const orphan = { ...record('orphan', log(OPEN()), { origin: 'subagent' }), inheritedEventCount: 0 };
+    const file = join(home, 'auto-continue-settled.json');
+    const first = scenario({ sessions: [orphan], overrides: { freshMs: 60_000 } });
+    first.host.start();
+    await settle();
+    assert.equal(first.store.state.reads, 1, 'the first boot decodes the log once');
+    // The save is coalesced behind a two second timer on the fake clock; step it and poll for the write it starts.
+    await settle(2100);
+    let saved;
+    for (let i = 0; i < 500; i += 1) {
+      try {
+        saved = JSON.parse(readFileSync(file, 'utf8')).entries;
+        break;
+      } catch {
+        await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+      }
+    }
+    assert.equal(saved?.orphan, orphan.revision, 'the refusal is recorded at the revision it was read at');
+
+    const second = scenario({ sessions: [orphan], overrides: { freshMs: 60_000 } });
+    second.host.start();
+    await settle();
+    assert.equal(second.store.state.reads, 0, 'the second boot skips the decode');
+    assert.ok(second.store.state.stats >= 1, 'the skip is decided from the cheap stat');
+    assert.equal(second.resumes.length, 0, 'and nothing is resumed');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));

@@ -278,7 +278,7 @@ export declare class AutoContinueRunner {
     /** One background pass: enumerate once after the services exist, then resume queued sessions within scanLimit. */
     private runPersisted;
     /**
-     * Where the rejection record lives: the composed profile home when one exists, else the default DSH home.
+     * Where the rejection record lives: the DSH home this host was started with, else the default one.
      */
     private persistedRejectionPath;
     /** Load the rejection record once per process. An unreadable record is ignored, never fatal. */

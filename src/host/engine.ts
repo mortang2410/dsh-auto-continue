@@ -2175,11 +2175,11 @@ export class AutoContinueRunner {
   }
 
   /**
-   * Where the rejection record lives: the composed profile home when one exists, else the default DSH home.
+   * Where the rejection record lives: the DSH home this host was started with, else the default one.
    */
   private persistedRejectionPath(): string {
-    const profile = this.ctx.get('profileContext') as { readonly home?: unknown } | undefined;
-    const home = typeof profile?.home === 'string' && profile.home !== '' ? profile.home : join(homedir(), '.dsh');
+    const configured = process.env.DSH_HOME;
+    const home = configured !== undefined && configured !== '' ? configured : join(homedir(), '.dsh');
     return join(home, 'auto-continue-rejections.json');
   }
 

@@ -286,6 +286,11 @@ export declare class AutoContinueRunner {
      * a loop that must not yield: the file is small and only the first call touches disk.
      */
     private loadPersistedRejections;
+    /**
+     * Remember that this session's log cannot be read at its current revision, so the next boot does not decode it
+     * again. The sweep owns this for stored roots: the loader never reads a root once a session query service exists.
+     */
+    private recordPersistedRejection;
     /** Persist the rejection record, coalescing bursts so one boot writes once. */
     private schedulePersistedRejectionSave;
     private savePersistedRejections;

@@ -1,5 +1,8 @@
 /** Boot-scan storage sweep: restart-interrupted sessions the registry has not loaded. */
 import assert from 'node:assert/strict';
+import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { makeHost, turnEnd, turnStart } from './host-fixture.mjs';
 
@@ -429,3 +432,55 @@ for (const stop of ['dispose', 'pause']) {
     assert.equal(host.resumes().length, 0);
   });
 }
+
+/**
+ * The record path comes from DSH_HOME, so each fixture gets its own home instead of the live one. Without that,
+ * one fixture's rejection would be skipped by the next, which is what made an earlier attempt at this check fail.
+ */
+async function rejectionHome(t, entries) {
+  const home = await mkdtemp(join(tmpdir(), 'ac-rejections-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  });
+  await writeFile(join(home, 'auto-continue-rejections.json'), `${JSON.stringify({ version: 1, entries })}\n`);
+}
+
+test('a stored log already rejected at this revision is not decoded again', async (t) => {
+  await rejectionHome(t, { stored: 'r1' });
+  const { host, tick } = scenario(t);
+  let observations = 0;
+  host.provide('sessionQuery', {
+    listSessions: async () => [{ header: { id: 'stored' }, live: false }],
+    observeSession: async () => {
+      observations += 1;
+      return { events: [turnEnd(1, 'interrupted')], header: { id: 'stored' }, [Symbol.dispose]() {} };
+    },
+  });
+  host.provide('sessionPersistence', { stat: async () => ({ revision: 'r1' }) });
+  host.start();
+  await tick();
+
+  assert.equal(observations, 0);
+  assert.equal(host.resumes().length, 0);
+});
+
+test('a stored log rejected at an older revision is decoded again', async (t) => {
+  await rejectionHome(t, { stored: 'r1' });
+  const { host, tick } = scenario(t);
+  let observations = 0;
+  host.provide('sessionQuery', {
+    listSessions: async () => [{ header: { id: 'stored' }, live: false }],
+    observeSession: async () => {
+      observations += 1;
+      return { events: [turnEnd(1, 'interrupted')], header: { id: 'stored' }, [Symbol.dispose]() {} };
+    },
+  });
+  host.provide('sessionPersistence', { stat: async () => ({ revision: 'r2' }) });
+  host.start();
+  await tick();
+
+  assert.equal(observations, 1);
+});

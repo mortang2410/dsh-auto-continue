@@ -2209,6 +2209,26 @@ export class AutoContinueRunner {
     return record;
   }
 
+  /**
+   * Remember that this session's log cannot be read at its current revision, so the next boot does not decode it
+   * again. The sweep owns this for stored roots: the loader never reads a root once a session query service exists.
+   */
+  private async recordPersistedRejection(
+    sessionId: SessionId,
+    persistence: PersistedStore | undefined,
+    record: Map<string, string>,
+  ): Promise<void> {
+    try {
+      if (persistence === undefined) return;
+      const revision = await this.persistedRevision(persistence, sessionId);
+      if (revision === undefined) return;
+      record.set(sessionId, revision);
+      this.schedulePersistedRejectionSave();
+    } catch {
+      // A memory of a failure must never itself fail the scan.
+    }
+  }
+
   /** Persist the rejection record, coalescing bursts so one boot writes once. */
   private schedulePersistedRejectionSave(): void {
     if (this.persistedRejectionSave !== undefined) return;
@@ -2976,6 +2996,7 @@ export class AutoContinueRunner {
     // Every stored root below is decoded in full, so a log this chain already failed to read is skipped here too.
     // The record is read once and synchronously: a session it does not name costs one map lookup, no await.
     const rejections = this.loadPersistedRejections();
+    const sweepPersistence = this.ctx.get('sessionPersistence') as PersistedStore | undefined;
     for (const record of records) {
       if (this.disposed || Date.now() >= deadline || this.getConfig().paused || !this.getConfig().scanOnBoot) return;
       if (typeof record?.header?.id !== 'string' || record.header.id === '') {
@@ -2988,14 +3009,24 @@ export class AutoContinueRunner {
       this.storedSwept.add(sessionId);
       if (record.header.origin === 'subagent') continue;
       if (rejections.has(sessionId)) {
-        const persistence = this.ctx.get('sessionPersistence') as PersistedStore | undefined;
-        const known = persistence === undefined ? undefined : await this.persistedRevision(persistence, sessionId);
-        if (known !== undefined && rejections.get(sessionId) === known) continue;
+        const currentRevision = sweepPersistence === undefined ? undefined : await this.persistedRevision(sweepPersistence, sessionId);
+        if (currentRevision !== undefined && rejections.get(sessionId) === currentRevision) continue;
       }
       observed += 1;
       let observation: StoredObservation | undefined;
       try {
-        const stored: StoredObservation = await this.readStored(signal => query.observeSession(sessionId, { projectionMode: 'all', signal }), deadline);
+        let stored: StoredObservation;
+        try {
+          stored = await this.readStored(signal => query.observeSession(sessionId, { projectionMode: 'all', signal }), deadline);
+        } catch (error) {
+          // Only a read failure is a property of the log. A stall belongs to this boot, so it is retried next time.
+          if (!(error instanceof PersistedCallTimeout)) {
+            await this.recordPersistedRejection(sessionId, sweepPersistence, rejections);
+          }
+          throw error;
+        }
+        // This artifact reads cleanly now, so the rejection recorded for an older revision of it is stale.
+        if (rejections.delete(sessionId)) this.schedulePersistedRejectionSave();
         observation = stored;
         if (this.disposed) return;
         if (this.sessionConfig(sessionId).paused) {

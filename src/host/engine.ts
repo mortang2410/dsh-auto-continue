@@ -2280,10 +2280,13 @@ export class AutoContinueRunner {
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
       // A log this scan already rejected is skipped without decoding it, but only while the artifact is unchanged:
-      // a repaired file has a new revision and gets a fresh attempt.
-      const revision = await this.persistedRevision(persistence, header.id);
-      if (revision !== undefined && rejections.get(header.id) === revision) continue;
-      const entry = await this.readPersistedEntry(persistence, header, now, config, revision);
+      // a repaired file has a new revision and gets a fresh attempt. The revision is only asked for a session the
+      // record already names, so a healthy store pays nothing for this.
+      if (rejections.has(header.id)) {
+        const revision = await this.persistedRevision(persistence, header.id);
+        if (revision !== undefined && rejections.get(header.id) === revision) continue;
+      }
+      const entry = await this.readPersistedEntry(persistence, header, now, config);
       if (entry !== undefined) queue.push(entry);
     }
     // Shallower sessions first, so a child's live parent is resumed before the child (resumeEntry needs it live).
@@ -2312,7 +2315,6 @@ export class AutoContinueRunner {
     header: PersistedHeader,
     now: number,
     config: AutoContinueConfig,
-    revision?: string,
   ): Promise<PersistedEntry | undefined> {
     try {
       const opening = persistence.open(header.id, 'read');
@@ -2375,7 +2377,7 @@ export class AutoContinueRunner {
           this.notifySpiralStopped(header.id, config);
           return undefined;
         }
-        if (revision !== undefined) {
+        if (this.persistedRejections?.has(header.id) === true) {
           // The same artifact now reads cleanly, so any older rejection of it is stale.
           const rejections = await this.loadPersistedRejections();
           if (rejections.delete(header.id)) this.schedulePersistedRejectionSave();
@@ -2393,11 +2395,15 @@ export class AutoContinueRunner {
         await withPersistedTimeout(handle.close()).catch(() => undefined);
       }
     } catch (error) {
-      // A stall is a property of this boot, not of the log, so only a real read failure is remembered.
-      if (revision !== undefined && !(error instanceof PersistedCallTimeout)) {
-        const rejections = await this.loadPersistedRejections();
-        rejections.set(header.id, revision);
-        this.schedulePersistedRejectionSave();
+      // A stall is a property of this boot, not of the log, so only a real read failure is remembered. The revision
+      // is read here, once, rather than for every row up front.
+      if (!(error instanceof PersistedCallTimeout)) {
+        const revision = await this.persistedRevision(persistence, header.id);
+        if (revision !== undefined) {
+          const rejections = await this.loadPersistedRejections();
+          rejections.set(header.id, revision);
+          this.schedulePersistedRejectionSave();
+        }
       }
       console.error(`[auto-continue] 跳过无法读取的持久化会话 ${header.id}: ${error instanceof Error ? error.message : String(error)}`);
       return undefined;

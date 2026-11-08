@@ -1414,10 +1414,11 @@ test('T48 a log that stalls on one pass is read again on the next', () => clocke
 }));
 
 /**
- * T49: a log that stalls twice stops being retried, so the scan moves past it. Two logs are involved. The first never
- * settles here; the second stalls once, then reads cleanly with nothing to resume, so it stays in persistedStalled and
- * keeps starting a new enumeration. That second stall is what used to reopen the first log again and again. Each log is
- * read once as a candidate and once more after its stall, and never again, while the session behind both is resumed.
+ * T49: a retry that stalls spends its log's one retry, so that log waits for the next boot, and the scan opens nothing
+ * more. Three logs are involved. The first stalls on every read and is retried once. The second stalls on its first
+ * read, and its retry reads cleanly with nothing to resume, so it leaves the stalled set on its own. The third holds a
+ * turn to resume, so its stall is what keeps the scan running past the first pass. Neither stalled log is opened again
+ * once its retry has stalled, and the third is resumed.
  */
 test('T49 a log that stalled twice is not read again while the scan keeps retrying another', () => clocked(async () => {
   const stalled = record('stalled', log(OPEN()));
@@ -1448,13 +1449,12 @@ test('T49 a log that stalled twice is not read again while the scan keeps retryi
 }));
 
 /**
- * T50: the retry is spent by the retry starting, whatever that retry then does. This log reads a whole history and then
- * stalls while closing the handle, so it yielded everything it had and still stalls inside its retry. Its one retry is
- * gone, so it must not stay in the retry set and reopen the log beside it: that log stalls on its first read, is retried
- * once, and is never opened again. Without the rule the scan kept re-enumerating for these logs and opened both again
- * and again.
+ * T50: a read handle whose close never settles is given up on within the read's own two-second budget, so the scan
+ * moves on and the log beside it is read exactly once, as a candidate. This log reads a whole history on every attempt
+ * and stalls closing the handle, and the log beside it stalls on every read. The close timeout is caught beside the
+ * read and never reaches the stall handler, so this test proves the bounded cleanup, not the retry bookkeeping.
  */
-test('T50 a retry that stalls after a good read is not read again', () => clocked(async () => {
+test('T50 a read whose close never settles is abandoned and the log beside it is read once', () => clocked(async () => {
   const stalled = record('stalled', log(OPEN()));
   const flaky = record('flaky', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'completed' })]));
   const boot = scenario({ sessions: [stalled, flaky], overrides: { freshMs: 600_000 } });
@@ -1498,3 +1498,34 @@ test('T51 a retried stall does not reopen the log beside it', () => clocked(asyn
   assert.equal(opens.ready, 1, 'the log behind the stall is resumed from the first pass and not read again');
   assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['ready'], 'and it is resumed once');
 }));
+
+/**
+ * T52: a log whose retry came back with nothing to resume is not read again by any later pass of the same boot. Two
+ * logs are involved. The first stalls on its first read and is owed a retry; the second is settled, so its first read
+ * resumes nothing. The second pass spends the first log's retry, which also resumes nothing, and stalls on the second
+ * log's retry, so a third pass runs. That third pass is where the first log used to be opened a third time. The
+ * spent-retry set keeps it out of the scan, and the third pass shows as a second read of the log whose retry stalled.
+ */
+test('T52 a log whose retry resumes nothing is not read again in the same boot', () => withHome(async () => clocked(async () => {
+  const now = Date.now();
+  const empty = record('empty', log(OPEN(), now - 1000));
+  const other = record('other', log([turnStart(1), turnEnd(1, { kind: 'completed' })], now));
+  const boot = scenario({ sessions: [empty, other], overrides: { freshMs: 600_000 } });
+  const realOpen = boot.store.open.bind(boot.store);
+  const opens = { empty: 0, other: 0 };
+  boot.store.open = async (id, access) => {
+    const handle = await realOpen(id, access);
+    opens[id] += 1;
+    // The first log stalls on its only candidate read and then reads cleanly when its retry comes.
+    if (id === 'empty' && opens.empty === 1) return { ...handle, read: () => new Promise(() => {}) };
+    // The second log reads cleanly once and stalls on the retry its pass owes it, which is what starts a third pass.
+    if (id === 'other' && opens.other > 1) return { ...handle, read: () => new Promise(() => {}) };
+    return handle;
+  };
+  boot.host.start();
+  await settle();
+  for (let pass = 0; pass < 5; pass += 1) await nextPass();
+  assert.equal(opens.empty, 2, 'the first log is read once as a candidate and once as its retry, and no later pass reads it');
+  assert.equal(opens.other, 3, 'the second log reads once as a candidate, stalls in its retry, and is read again by the pass that retry starts');
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['empty'], 'only the first log holds a turn to resume');
+})));

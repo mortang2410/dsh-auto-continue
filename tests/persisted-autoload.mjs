@@ -1471,6 +1471,30 @@ test('T50 a retry that stalls after a good read is not read again', () => clocke
   await settle();
   for (let pass = 0; pass < 8; pass += 1) await nextPass();
   assert.equal(opens.flaky, 2, 'the retried log is read once as a candidate and once as its retry, and never again');
-  assert.equal(opens.stalled, 2, 'the log beside it keeps its single retry and is not reopened by the other one');
-  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), [], 'neither log is resumed');
+}));
+
+/**
+ * T51: a log that stalls on its very first read does not reopen the log beside it on the pass that retries it. Both logs
+ * read: the first stalls and is owed one retry, the second gives the scan something to resume, and the scan that reads
+ * both again is the one a stall used to force. Each log is therefore opened exactly once per pass that reads it, and the
+ * second is opened only on the first pass.
+ */
+test('T51 a retried stall does not reopen the log beside it', () => clocked(async () => {
+  const stalled = record('stalled', log(OPEN()));
+  const ready = record('ready', log(OPEN()));
+  const boot = scenario({ sessions: [stalled, ready], overrides: { freshMs: 60_000 } });
+  const realOpen = boot.store.open.bind(boot.store);
+  const opens = { stalled: 0, ready: 0 };
+  boot.store.open = async (id, access) => {
+    const handle = await realOpen(id, access);
+    opens[id] += 1;
+    if (id === 'stalled') return { ...handle, read: () => new Promise(() => {}) };
+    return handle;
+  };
+  boot.host.start();
+  await settle();
+  for (let pass = 0; pass < 4; pass += 1) await nextPass();
+  assert.equal(opens.stalled, 2, 'the stalled log is read once and retried once');
+  assert.equal(opens.ready, 1, 'the log behind the stall is resumed from the first pass and not read again');
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['ready'], 'and it is resumed once');
 }));

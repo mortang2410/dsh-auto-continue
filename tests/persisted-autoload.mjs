@@ -1202,3 +1202,35 @@ test('T41 a slow cleanup of a live row does not cost a later session its resume'
     await rm(home, { recursive: true, force: true });
   }
 }));
+
+/**
+ * T42: the disk check runs beside the scan, so a shutdown can land while its stat is still out. That must leave the
+ * file exactly as it was: no save runs, and the row keeps its revision, so the next boot sees a settled row rather
+ * than one deleted by a drop that never finished.
+ */
+test('T42 a shutdown during the disk check leaves the row alone', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  try {
+    const live = record('live', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { live: live.revision } })}\n`, 'utf8');
+    // The stat takes exactly as long as the scan needs to finish, so it settles one tick after dispose.
+    const boot = scenario({ sessions: [live], statDelay: { live: 1 } });
+    boot.host.agents.set('live', boot.host.agent('live', live.events));
+    boot.host.start();
+    // Let the scan reach the slow stat, then dispose while it is still out.
+    await settle();
+    assert.deepEqual(boot.store.state.statted, ['live'], 'the check started and is waiting on the stat');
+    boot.host.dispose();
+    // The stat now settles after dispose, and every timer runs for five early-clock seconds past it.
+    await settle(5000);
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row is still on disk');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));

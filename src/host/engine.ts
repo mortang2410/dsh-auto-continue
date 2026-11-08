@@ -2473,7 +2473,7 @@ export class AutoContinueRunner {
     // Bound each batch by the ids waiting when it starts: one slow stat must not chain into an unbounded loop.
     // startPersistedSettledCheck's disposed guard sends no new batch after shutdown, and the loop comments below stop on it.
     const batch = [...(this.persistedSettledPending ?? [])] as [SessionId, string][];
-    const checked: SessionId[] = [];
+    const checked: [SessionId, string][] = [];
     try {
       for (const [id, known] of batch) {
         if (this.disposed) return;
@@ -2481,7 +2481,7 @@ export class AutoContinueRunner {
         // Shutdown may land while the stat is out. A row recorded after it would schedule a save dispose can no longer
         // cancel, so the check stops here and leaves the disk as it is.
         if (this.disposed) return;
-        checked.push(id);
+        checked.push([id, known]);
         // Only the revision this host settled at makes the removal its own: a newer revision is another host's verdict,
         // and an unreadable one proves nothing about a row that may not be this host's to remove.
         if (droppedAt !== known) continue;
@@ -2492,7 +2492,9 @@ export class AutoContinueRunner {
       if (checked.length > 0) progress.drained += checked.length;
       const pending = this.persistedSettledPending;
       if (pending !== undefined) {
-        for (const id of checked) pending.delete(id);
+        // Only the revision this batch checked leaves the queue: a newer one offered while the stat was out is a
+        // different drop, and the next batch picks it up.
+        for (const [id, known] of checked) if (pending.get(id) === known) pending.delete(id);
         if (pending.size === 0) this.persistedSettledPending = undefined;
       }
     }

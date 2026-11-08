@@ -87,8 +87,9 @@ export declare class AutoContinueRunner {
     /** Persisted sessions are enumerated once per boot, after the service is available. */
     private persistedEnumerated;
     /**
-     * A log whose read stalled this boot, and that a later pass has to read again. Enumeration is otherwise once per
-     * boot, so without this a stall inside a completed enumeration was never retried and the log line said it would be.
+     * A log whose first read stalled this boot, and that a later pass has to read once more. Enumeration is otherwise
+     * once per boot, so without this a stall inside a completed enumeration was never retried and the log line said it
+     * would be. The id leaves the set when the owed read starts, so a retry that stalls again asks for nothing more.
      */
     private readonly persistedStalled;
     private readonly persistedDecided;
@@ -334,8 +335,13 @@ export declare class AutoContinueRunner {
     private checkPersistedSettledDropped;
     /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */
     private resumeQueuedPersisted;
-    /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an
-     * unreadable one at a known revision is remembered so the next boot skips it without decoding it again. */
+    /**
+     * Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an
+     * unreadable one at a known revision is remembered so the next boot skips it without decoding it again.
+     * `retrySpent` marks a read that spends the log's one retry: a stall in it owes nothing more, so the id stays out of
+     * the retry set even if this read happens to succeed first. `verdict.settled` is set only when the log itself
+     * decides the session can never be resumed.
+     */
     private readPersistedEntry;
     /** Resume one persisted session through the host. A failure or stall drops it for this boot; only a boot Continue is retried (deliverChild). */
     private resumePersisted;

@@ -760,8 +760,9 @@ export class AutoContinueRunner {
   /** Persisted sessions are enumerated once per boot, after the service is available. */
   private persistedEnumerated = false;
   /**
-   * A log whose read stalled this boot, and that a later pass has to read again. Enumeration is otherwise once per
-   * boot, so without this a stall inside a completed enumeration was never retried and the log line said it would be.
+   * A log whose first read stalled this boot, and that a later pass has to read once more. Enumeration is otherwise
+   * once per boot, so without this a stall inside a completed enumeration was never retried and the log line said it
+   * would be. The id leaves the set when the owed read starts, so a retry that stalls again asks for nothing more.
    */
   private readonly persistedStalled = new Set<SessionId>();
   private readonly persistedDecided = new Set<SessionId>();
@@ -2447,10 +2448,11 @@ export class AutoContinueRunner {
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
       // A log whose read stalled on an earlier pass is read once more before the revision bookkeeping below can skip
-      // it, because a stall decides nothing about the log. That retry reads the log or stalls again; either way the
-      // retry set is then empty for it.
-      if (this.persistedStalled.has(header.id)) {
-        const retried = await this.readPersistedEntry(persistence, header, now, config, { settled: false });
+      // it, because a stall decides nothing about the log. The retry is owed by the id being in the set, and it is
+      // spent whatever the retry does: a read that yields a turn, a read that yields nothing, and a stall all take
+      // the id out, so no later pass reads the log again and the scan can finish enumerating.
+      if (this.persistedStalled.delete(header.id)) {
+        const retried = await this.readPersistedEntry(persistence, header, now, config, { settled: false, retrySpent: true });
         if (retried !== undefined) queue.push(retried);
         continue;
       }
@@ -2462,7 +2464,7 @@ export class AutoContinueRunner {
       // A log this scan already rejected is skipped without decoding it, but only while the artifact is unchanged:
       // a repaired file has a new revision and gets a fresh attempt.
       if (rejections.has(header.id) && revision !== undefined && rejections.get(header.id) === revision) continue;
-      const verdict = { settled: false };
+      const verdict = { settled: false, retrySpent: false };
       const entry = await this.readPersistedEntry(persistence, header, now, config, verdict);
       if (entry !== undefined) {
         queue.push(entry);
@@ -2551,14 +2553,19 @@ export class AutoContinueRunner {
     }
   }
 
-  /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an
-   * unreadable one at a known revision is remembered so the next boot skips it without decoding it again. */
+  /**
+   * Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an
+   * unreadable one at a known revision is remembered so the next boot skips it without decoding it again.
+   * `retrySpent` marks a read that spends the log's one retry: a stall in it owes nothing more, so the id stays out of
+   * the retry set even if this read happens to succeed first. `verdict.settled` is set only when the log itself
+   * decides the session can never be resumed.
+   */
   private async readPersistedEntry(
     persistence: PersistedStore,
     header: PersistedHeader,
     now: number,
     config: AutoContinueConfig,
-    verdict: { settled: boolean },
+    verdict: { settled: boolean; retrySpent: boolean },
   ): Promise<PersistedEntry | undefined> {
     try {
       const opening = persistence.open(header.id, 'read');
@@ -2595,8 +2602,8 @@ export class AutoContinueRunner {
         }
         const lastActivityAt = persistedLastActivity(ownEvents, now, config);
         // The log read this time, so nothing is owed to a later pass for it, whether or not it holds a turn to resume.
-        // A read that ends here without a resume used to leave the id in the retry set, and every later pass read it
-        // again while the scan could never finish enumerating.
+        // The retry this read spends was taken out of the set by the caller; this covers the first read of a log whose
+        // earlier attempt in this same pass stalled before the read returned anything.
         this.persistedStalled.delete(header.id);
         if (lastActivityAt === undefined) return undefined;
         let lastEnd: SessionEvent<'turn/end'> | undefined;
@@ -2654,9 +2661,10 @@ export class AutoContinueRunner {
       // is read here, once, rather than for every row up front.
       const stalled = error instanceof PersistedCallTimeout;
       if (stalled) {
-        // A first stall asks for one retry on the next pass. A second stall asks for nothing more: the retry set
-        // empties, so the scan stops re-enumerating and the log waits for the next boot.
-        if (!this.persistedStalled.delete(header.id)) this.persistedStalled.add(header.id);
+        // A first stall asks for one retry on the next pass. A stall in the retry itself asks for nothing more: the
+        // log waits for the next boot, and the scan stops re-enumerating for it. The outcome of the retry is not the
+        // question, a retry that read events and stalled on its close spends the retry just the same.
+        if (!verdict.retrySpent) this.persistedStalled.add(header.id);
       } else {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined) {

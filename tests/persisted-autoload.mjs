@@ -1446,3 +1446,31 @@ test('T49 a log that stalled twice is not read again while the scan keeps retryi
   assert.equal(opens.flaky, 2, 'the log that stalls once is retried once and then reads cleanly');
   assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['ready'], 'the session behind both is resumed');
 }));
+
+/**
+ * T50: the retry is spent by the retry starting, whatever that retry then does. This log reads a whole history and then
+ * stalls while closing the handle, so it yielded everything it had and still stalls inside its retry. Its one retry is
+ * gone, so it must not stay in the retry set and reopen the log beside it: that log stalls on its first read, is retried
+ * once, and is never opened again. Without the rule the scan kept re-enumerating for these logs and opened both again
+ * and again.
+ */
+test('T50 a retry that stalls after a good read is not read again', () => clocked(async () => {
+  const stalled = record('stalled', log(OPEN()));
+  const flaky = record('flaky', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'completed' })]));
+  const boot = scenario({ sessions: [stalled, flaky], overrides: { freshMs: 600_000 } });
+  const realOpen = boot.store.open.bind(boot.store);
+  const opens = { stalled: 0, flaky: 0 };
+  boot.store.open = async (id, access) => {
+    const handle = await realOpen(id, access);
+    opens[id] += 1;
+    if (id === 'stalled') return { ...handle, read: () => new Promise(() => {}) };
+    // Every read of this log succeeds; every close of it stalls, the retry's included.
+    return { ...handle, close: () => new Promise(() => {}) };
+  };
+  boot.host.start();
+  await settle();
+  for (let pass = 0; pass < 8; pass += 1) await nextPass();
+  assert.equal(opens.flaky, 2, 'the retried log is read once as a candidate and once as its retry, and never again');
+  assert.equal(opens.stalled, 2, 'the log beside it keeps its single retry and is not reopened by the other one');
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), [], 'neither log is resumed');
+}));

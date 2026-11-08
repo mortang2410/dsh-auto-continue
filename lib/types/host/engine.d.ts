@@ -95,6 +95,8 @@ export declare class AutoContinueRunner {
     private persistedRejectionSave;
     /** Id to the log revision a scan already settled, plus the config the verdict was reached under. */
     private persistedSettled;
+    /** Id to the revision this host settled at, for rows it dropped because the session became live. */
+    private persistedSettledDropped;
     private persistedSettledSave;
     /** Eligible persisted sessions not yet resumed, newest activity first. */
     private persistedQueue;

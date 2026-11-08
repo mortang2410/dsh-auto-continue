@@ -758,6 +758,8 @@ export class AutoContinueRunner {
   private persistedRejectionSave: ReturnType<typeof setTimeout> | undefined;
   /** Id to the log revision a scan already settled, plus the config the verdict was reached under. */
   private persistedSettled: Map<string, string> | undefined;
+  /** Id to the revision this host settled at, for rows it dropped because the session became live. */
+  private persistedSettledDropped: Map<string, string> | undefined;
   private persistedSettledSave: ReturnType<typeof setTimeout> | undefined;
   /** Eligible persisted sessions not yet resumed, newest activity first. */
   private persistedQueue: PersistedEntry[] = [];
@@ -2319,9 +2321,16 @@ export class AutoContinueRunner {
   private async savePersistedSettled(): Promise<void> {
     const record = this.persistedSettled;
     if (record === undefined) return;
+    // A row this host dropped is removed from what another host wrote, but only at the revision this host settled at:
+    // a different revision there is that host's newer verdict, and this one has no standing to discard it.
+    const dropped = this.persistedSettledDropped;
+    this.persistedSettledDropped = undefined;
     // Another host on this home may have settled rows since this one loaded; merge them so neither writer wins alone.
     // Moving this process's ids to the end keeps the cap evicting the least recently written rows.
     const merged = this.readPersistedSettledEntries();
+    for (const [id, revision] of dropped ?? []) {
+      if (merged.get(id) === revision) merged.delete(id);
+    }
     for (const [id, revision] of record) {
       merged.delete(id);
       merged.set(id, revision);
@@ -2388,7 +2397,21 @@ export class AutoContinueRunner {
     const settled = this.loadPersistedSettled();
     for (const { header } of snapshots) {
       if (!this.persistedOpen()) return;
-      if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) continue;
+      if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) {
+        // A settled row for a session that is now live can never be consulted again, so it leaves the record here
+        // rather than waiting for the cap to evict it. The save needs the revision, so it is read before the drop and
+        // the drop stays only while that is the revision on disk.
+        const known = settled.get(header.id);
+        if (known !== undefined) {
+          const droppedAt = await this.persistedRevision(persistence, header.id);
+          if (droppedAt === undefined || droppedAt === known) {
+            settled.delete(header.id);
+            (this.persistedSettledDropped ??= new Map()).set(header.id, known);
+            this.schedulePersistedSettledSave();
+          }
+        }
+        continue;
+      }
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
       // One stat decides whether the log needs decoding at all: a read parses the whole log, which is the expensive part

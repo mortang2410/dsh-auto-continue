@@ -1056,3 +1056,89 @@ test('T38 a parentless child is settled by one read, so the second boot spends n
     await rm(home, { recursive: true, force: true });
   }
 }));
+
+/**
+ * T39: a row describes a session that could not be continued. Once that same session is live, the row can never be
+ * consulted again, so it leaves the record instead of waiting for the 5,000-row cap. A save that only merges rows
+ * would put it back, which is exactly what the disk assertion here catches.
+ */
+test('T39 a settled row leaves the record once its session is live', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  const readEntries = () => {
+    try {
+      return JSON.parse(readFileSync(file, 'utf8')).entries;
+    } catch {
+      return undefined;
+    }
+  };
+  const waitFor = async (predicate) => {
+    for (let i = 0; i < 500; i += 1) {
+      if (predicate(readEntries())) return readEntries();
+      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+    }
+    return readEntries();
+  };
+  try {
+    const child = record('child', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    const first = scenario({ sessions: [child] });
+    first.host.start();
+    await settle();
+    assert.equal(readEntries(), undefined, 'nothing is written before a verdict exists');
+    // The child has no agent, so nothing settled it; write its row by hand as a settled boot would have.
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { child: child.revision } })}\n`, 'utf8');
+    first.host.dispose();
+    hosts.length = 0;
+
+    // The second boot finds that session already live in this host, so its row describes a state that has passed.
+    const live = scenario({ sessions: [child] });
+    live.host.agents.set('child', live.host.agent('child', child.events));
+    live.host.start();
+    await settle();
+    await settle(2100);
+    const afterDelete = await waitFor((entries) => entries !== undefined && entries.child === undefined);
+    assert.deepEqual(afterDelete, {}, 'the row for the live session is gone from the file');
+    assert.equal(live.store.state.reads, 0, 'and the live session was never decoded');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));
+
+/**
+ * T40: the marker is the point. A row that another host rewrote at a newer revision belongs to that host's knowledge,
+ * so this boot's deletion of an older revision must not remove it.
+ */
+test('T40 a deleted row another host rewrote at a new revision survives', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  try {
+    const child = record('child', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { child: 'r1' } })}\n`, 'utf8');
+    const live = scenario({ sessions: [child] });
+    live.host.agents.set('child', live.host.agent('child', child.events));
+    live.host.start();
+    await settle();
+    // Another host settles the same id at a newer revision after this one loaded its record.
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { child: 'r9' } })}\n`, 'utf8');
+    await settle(2100);
+    for (let i = 0; i < 500; i += 1) {
+      const entries = JSON.parse(readFileSync(file, 'utf8')).entries;
+      if (entries.child === 'r9') break;
+      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+    }
+    const entries = JSON.parse(readFileSync(file, 'utf8')).entries;
+    assert.equal(entries.child, 'r9', 'the newer revision another host wrote is kept');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));

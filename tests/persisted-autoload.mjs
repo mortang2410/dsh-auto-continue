@@ -1384,3 +1384,30 @@ test('T47 a stalled log does not stop an already-queued session from resuming', 
   assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['ready'], 'the healthy session is resumed');
   assert.equal(boot.resumes.length, 1, 'and the stalled one is not resumed');
 }));
+
+/**
+ * T48: a log that stalls is read again on a later pass, so the line that says it will be retried is true. Enumeration
+ * runs once per boot, so a stall inside a completed enumeration used to drop the session for the whole window while
+ * the log still told the operator it would be retried. Here the first read never settles inside its budget and the
+ * read after it is ordinary, so the second pass must resume that session.
+ */
+test('T48 a log that stalls on one pass is read again on the next', () => clocked(async () => {
+  const stalled = record('stalled', log(OPEN()));
+  const boot = scenario({ sessions: [stalled], overrides: { freshMs: 60_000 } });
+  const realOpen = boot.store.open.bind(boot.store);
+  let opens = 0;
+  boot.store.open = async (id, access) => {
+    const handle = await realOpen(id, access);
+    opens += 1;
+    // The first read never settles, so its budget expires and the pass moves on. The next pass gets a plain log.
+    if (opens > 1) return handle;
+    return { ...handle, read: () => new Promise(() => {}) };
+  };
+  boot.host.start();
+  await settle();
+  await settle(3000);
+  assert.equal(boot.resumes.length, 0, 'the first pass cannot resume a log it could not read');
+  await nextPass();
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['stalled'], 'the next pass reads the log and resumes it');
+  assert.equal(opens, 2, 'the log is opened again rather than skipped as settled or unreadable');
+}));

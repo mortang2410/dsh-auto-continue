@@ -86,6 +86,11 @@ export declare class AutoContinueRunner {
     private wakeBootScan;
     /** Persisted sessions are enumerated once per boot, after the service is available. */
     private persistedEnumerated;
+    /**
+     * A log whose read stalled this boot, and that a later pass has to read again. Enumeration is otherwise once per
+     * boot, so without this a stall inside a completed enumeration was never retried and the log line said it would be.
+     */
+    private readonly persistedStalled;
     private readonly persistedDecided;
     /**
      * Session id to the artifact revision that failed to read, kept across restarts so a boot does not decode a log it

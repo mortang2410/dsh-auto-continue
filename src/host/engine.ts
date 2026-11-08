@@ -759,6 +759,11 @@ export class AutoContinueRunner {
   private wakeBootScan: (() => void) | undefined;
   /** Persisted sessions are enumerated once per boot, after the service is available. */
   private persistedEnumerated = false;
+  /**
+   * A log whose read stalled this boot, and that a later pass has to read again. Enumeration is otherwise once per
+   * boot, so without this a stall inside a completed enumeration was never retried and the log line said it would be.
+   */
+  private readonly persistedStalled = new Set<SessionId>();
   private readonly persistedDecided = new Set<SessionId>();
   /**
    * Session id to the artifact revision that failed to read, kept across restarts so a boot does not decode a log it
@@ -2192,7 +2197,7 @@ export class AutoContinueRunner {
 
   /** One background pass: enumerate once after the services exist, then resume queued sessions within scanLimit. */
   private async runPersisted(config: AutoContinueConfig): Promise<void> {
-    if (!this.persistedEnumerated) {
+    if (!this.persistedEnumerated || this.persistedStalled.size > 0) {
       const persistence = this.ctx.get('sessionPersistence') as PersistedStore | undefined;
       const registry = this.ctx.get('workspaceRegistry') as PersistedRegistry | undefined;
       if (persistence === undefined || registry === undefined) {
@@ -2441,6 +2446,13 @@ export class AutoContinueRunner {
       }
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
+      // A log whose read stalled on an earlier pass is read before the revision bookkeeping below can skip it: the
+      // stall decided nothing about this log, and the pass that saw it promised to read it again.
+      if (this.persistedStalled.has(header.id)) {
+        const retried = await this.readPersistedEntry(persistence, header, now, config, { settled: false });
+        if (retried !== undefined) queue.push(retried);
+        continue;
+      }
       // One stat decides whether the log needs decoding at all: a read parses the whole log, which is the expensive part
       // of the pass, and the revision changes as soon as the bytes do.
       const revision = await this.persistedRevision(persistence, header.id);
@@ -2619,6 +2631,8 @@ export class AutoContinueRunner {
           const rejections = this.loadPersistedRejections();
           if (rejections.delete(header.id)) this.schedulePersistedRejectionSave();
         }
+        // The log read, so nothing is owed to a later pass for it.
+        this.persistedStalled.delete(header.id);
         return {
           id: header.id,
           lastActivityAt,
@@ -2634,7 +2648,12 @@ export class AutoContinueRunner {
     } catch (error) {
       // A stall is a property of this boot, not of the log, so only a real read failure is remembered. The revision
       // is read here, once, rather than for every row up front.
-      if (!(error instanceof PersistedCallTimeout)) {
+      const stalled = error instanceof PersistedCallTimeout;
+      if (stalled) {
+        // Remembered so the next pass reads this log again: enumeration otherwise runs once per boot, and the log line
+        // below tells the operator it will be retried.
+        this.persistedStalled.add(header.id);
+      } else {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined) {
           const rejections = this.loadPersistedRejections();
@@ -2644,7 +2663,6 @@ export class AutoContinueRunner {
       }
       // A stall and an unreadable log are different facts for the operator: the first is retried next pass, the
       // second is remembered until the bytes change. One line for both told the operator the log was unreadable.
-      const stalled = error instanceof PersistedCallTimeout;
       console.error(
         `[auto-continue] ${stalled ? '本次跳过读取超时的持久化会话, 下一轮重试' : '跳过无法读取的持久化会话'} ${header.id}: ${
           error instanceof Error ? error.message : String(error)

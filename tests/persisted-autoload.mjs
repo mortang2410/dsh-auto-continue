@@ -1358,3 +1358,29 @@ test('T45 a throwing stat accessor neither spins nor removes the row', () => clo
     await rm(home, { recursive: true, force: true });
   }
 }));
+
+/**
+ * T47: one stalled log must not cost every other session its recovery. A session queued before the stall is resumed
+ * in the same pass, or by the next one, instead of waiting for an enumeration that never finishes. The stall is a
+ * read that never settles, so the pass has to move past it rather than wait for its 10 s call budget.
+ */
+test('T47 a stalled log does not stop an already-queued session from resuming', () => clocked(async () => {
+  const stalled = record('stalled', log(OPEN()));
+  const ready = record('ready', log(OPEN()));
+  const boot = scenario({
+    sessions: [stalled, ready],
+    // Only the stalled log's open never settles; the other session is ordinary.
+    openGate: undefined,
+    overrides: { freshMs: 60_000 },
+  });
+  const realOpen = boot.store.open.bind(boot.store);
+  boot.store.open = async (id, access) => {
+    if (id === 'stalled') return new Promise(() => {});
+    return realOpen(id, access);
+  };
+  boot.host.start();
+  await settle();
+  await settle(3000);
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['ready'], 'the healthy session is resumed');
+  assert.equal(boot.resumes.length, 1, 'and the stalled one is not resumed');
+}));

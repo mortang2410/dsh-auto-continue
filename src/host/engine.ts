@@ -588,6 +588,16 @@ function persistedChildDescriptor(
 /** Hard limit on one host call the boot loader makes (list, open, read, close, resume). Not configurable. */
 const PERSISTED_CALL_TIMEOUT_MS = 10_000;
 
+/**
+ * The longest the enumeration waits on one log's open or read before moving to the next candidate. A user-session
+ * resume keeps the full call budget (PERSISTED_CALL_TIMEOUT_MS), because aborting a resume that would have finished
+ * loses the session a second time. Enumeration is different: it only decides what to queue, so a log that has not
+ * opened or read within this budget is left for the next pass, and every session listed after it still gets its turn
+ * inside the window. Sized so several stalled logs still leave most of a 15 minute window for the resumes the
+ * enumeration queues.
+ */
+const PERSISTED_ENUMERATE_CALL_TIMEOUT_MS = 2_000;
+
 /** A host call the boot loader stopped waiting for. The call itself may still settle later. */
 class PersistedCallTimeout extends Error {}
 
@@ -656,13 +666,13 @@ function logResumeFailure(entry: PersistedEntry, error: unknown): void {
  * so it does not keep the process alive. A late settle of `call` is not observed here. `onTimeout` runs when the wait
  * gives up, so a caller can abort the work behind `call` (a child delivery aborts its signal this way).
  */
-async function withPersistedTimeout<T>(call: Promise<T>, onTimeout?: () => void): Promise<T> {
+async function withPersistedTimeout<T>(call: Promise<T>, onTimeout?: () => void, budgetMs = PERSISTED_CALL_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       onTimeout?.();
-      reject(new PersistedCallTimeout(`host call timed out after ${PERSISTED_CALL_TIMEOUT_MS} ms`));
-    }, PERSISTED_CALL_TIMEOUT_MS);
+      reject(new PersistedCallTimeout(`host call timed out after ${budgetMs} ms`));
+    }, budgetMs);
   });
   try {
     return await Promise.race([call, timeout]);
@@ -2190,7 +2200,9 @@ export class AutoContinueRunner {
         return;
       }
       await this.enumeratePersisted(persistence, registry, config);
-      if (!this.persistedEnumerated) return;
+      // A pass that stopped at the deadline still hands its queue over: the sessions it decided are resumed now, and
+      // the enumeration is retried for the rest while the window is open.
+      if (this.persistedQueue.length === 0 && !this.persistedEnumerated) return;
     }
     await this.resumeQueuedPersisted(config);
   }
@@ -2392,6 +2404,18 @@ export class AutoContinueRunner {
     const archived = new Set(registry.archivedSessionIds);
     const now = Date.now();
     const queue: PersistedEntry[] = [];
+    /**
+     * Hand what this pass decided to the resume step, whether the pass reached the end of the listing or stopped at the
+     * deadline. A pass that queued nothing and then returned used to discard every decision it had made, so one slow
+     * call cost every session listed before it its recovery. Enumerated is set only when every candidate was visited, so
+     * a partial pass is retried and re-reads nothing it already queued twice.
+     */
+    const handOff = (entries: PersistedEntry[], complete = false): void => {
+      // Shallower first, so a child's live parent is resumed before the child (resumeEntry needs it live).
+      const sorted = [...entries].sort((left, right) => left.depth - right.depth || right.lastActivityAt - left.lastActivityAt);
+      this.persistedQueue = sorted;
+      this.persistedEnumerated = complete;
+    };
     // The stored sweep (sweepStoredSessions) materializes root sessions whenever sessionQuery exists, so the loader
     // resumes roots only on hosts without it. Children are always the loader's (continueChild), so one path per session.
     // If sessionQuery registers after this read, the loader may already own a root; bootResumeClaims keeps the sweep from
@@ -2400,7 +2424,10 @@ export class AutoContinueRunner {
     const rejections = this.loadPersistedRejections();
     const settled = this.loadPersistedSettled();
     for (const { header } of snapshots) {
-      if (!this.persistedOpen()) return;
+      if (!this.persistedOpen()) {
+        handOff(queue);
+        return;
+      }
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) {
         // A settled row for a session that is now live can never be consulted again, so it leaves the record here
         // rather than waiting for the cap to evict it. The revision that decides the disk removal is a host call, so
@@ -2435,10 +2462,7 @@ export class AutoContinueRunner {
         this.schedulePersistedSettledSave();
       }
     }
-    // Shallower sessions first, so a child's live parent is resumed before the child (resumeEntry needs it live).
-    queue.sort((left, right) => left.depth - right.depth || right.lastActivityAt - left.lastActivityAt);
-    this.persistedQueue = queue;
-    this.persistedEnumerated = true;
+    handOff(queue, true);
   }
 
   /**
@@ -2525,7 +2549,7 @@ export class AutoContinueRunner {
   ): Promise<PersistedEntry | undefined> {
     try {
       const opening = persistence.open(header.id, 'read');
-      const handle = await withPersistedTimeout(opening).catch((error: unknown) => {
+      const handle = await withPersistedTimeout(opening, undefined, PERSISTED_ENUMERATE_CALL_TIMEOUT_MS).catch((error: unknown) => {
         // A late open still returns a tracked read handle; close it rather than leave it open.
         void opening.then((late) => late.close()).catch(() => undefined);
         throw error;
@@ -2533,7 +2557,7 @@ export class AutoContinueRunner {
       try {
         // Checked after the open settles: an open that straddles the window must not start a read. The handle is closed below.
         if (!this.persistedOpen()) return undefined;
-        const { events } = await withPersistedTimeout(handle.read(0));
+        const { events } = await withPersistedTimeout(handle.read(0), undefined, PERSISTED_ENUMERATE_CALL_TIMEOUT_MS);
         let childDescriptor: PersistedChildDescriptor | undefined;
         let ownEvents = events;
         const depth = header.delegationDepth ?? 0;
@@ -2618,7 +2642,14 @@ export class AutoContinueRunner {
           this.schedulePersistedRejectionSave();
         }
       }
-      console.error(`[auto-continue] 跳过无法读取的持久化会话 ${header.id}: ${error instanceof Error ? error.message : String(error)}`);
+      // A stall and an unreadable log are different facts for the operator: the first is retried next pass, the
+      // second is remembered until the bytes change. One line for both told the operator the log was unreadable.
+      const stalled = error instanceof PersistedCallTimeout;
+      console.error(
+        `[auto-continue] ${stalled ? '本次跳过读取超时的持久化会话, 下一轮重试' : '跳过无法读取的持久化会话'} ${header.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       return undefined;
     }
   }

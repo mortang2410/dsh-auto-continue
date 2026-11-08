@@ -97,6 +97,9 @@ export declare class AutoContinueRunner {
     private persistedSettled;
     /** Id to the revision this host settled at, for rows it dropped because the session became live. */
     private persistedSettledDropped;
+    /** Ids whose disk revision is still to be checked before the save may remove them. */
+    private persistedSettledPending;
+    private persistedSettledCheck;
     private persistedSettledSave;
     /** Eligible persisted sessions not yet resumed, newest activity first. */
     private persistedQueue;
@@ -315,6 +318,13 @@ export declare class AutoContinueRunner {
      * flight and is awaited again rather than repeated, so at most one list() is in flight.
      */
     private enumeratePersisted;
+    /**
+     * Read the revision a dropped row is at on disk, then let the save remove it only at the revision this host settled
+     * at. Runs beside the scan, never inside it: the host call may be slow, and the scan's deadline is not the save's
+     * to spend. One check at a time; ids that arrive while one runs wait for the next.
+     */
+    private dropPersistedSettled;
+    private checkPersistedSettledDropped;
     /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */
     private resumeQueuedPersisted;
     /** Read one persisted session's history (read-only open). Stalled or unreadable histories are skipped, and an

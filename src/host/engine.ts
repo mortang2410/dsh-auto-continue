@@ -760,6 +760,9 @@ export class AutoContinueRunner {
   private persistedSettled: Map<string, string> | undefined;
   /** Id to the revision this host settled at, for rows it dropped because the session became live. */
   private persistedSettledDropped: Map<string, string> | undefined;
+  /** Ids whose disk revision is still to be checked before the save may remove them. */
+  private persistedSettledPending: Map<string, string> | undefined;
+  private persistedSettledCheck: Promise<void> | undefined;
   private persistedSettledSave: ReturnType<typeof setTimeout> | undefined;
   /** Eligible persisted sessions not yet resumed, newest activity first. */
   private persistedQueue: PersistedEntry[] = [];
@@ -2399,16 +2402,12 @@ export class AutoContinueRunner {
       if (!this.persistedOpen()) return;
       if (archived.has(header.id) || this.ctx.agents.get(header.id) !== undefined) {
         // A settled row for a session that is now live can never be consulted again, so it leaves the record here
-        // rather than waiting for the cap to evict it. The save needs the revision, so it is read before the drop and
-        // the drop stays only while that is the revision on disk.
+        // rather than waiting for the cap to evict it. The revision that decides the disk removal is a host call, so
+        // the check runs beside the scan: a slow backend must not spend the startup window on bookkeeping.
         const known = settled.get(header.id);
         if (known !== undefined) {
-          const droppedAt = await this.persistedRevision(persistence, header.id);
-          if (droppedAt === undefined || droppedAt === known) {
-            settled.delete(header.id);
-            (this.persistedSettledDropped ??= new Map()).set(header.id, known);
-            this.schedulePersistedSettledSave();
-          }
+          settled.delete(header.id);
+          this.dropPersistedSettled(persistence, header.id, known);
         }
         continue;
       }
@@ -2439,6 +2438,38 @@ export class AutoContinueRunner {
     queue.sort((left, right) => left.depth - right.depth || right.lastActivityAt - left.lastActivityAt);
     this.persistedQueue = queue;
     this.persistedEnumerated = true;
+  }
+
+  /**
+   * Read the revision a dropped row is at on disk, then let the save remove it only at the revision this host settled
+   * at. Runs beside the scan, never inside it: the host call may be slow, and the scan's deadline is not the save's
+   * to spend. One check at a time; ids that arrive while one runs wait for the next.
+   */
+  private dropPersistedSettled(persistence: PersistedStore, id: SessionId, known: string): void {
+    (this.persistedSettledPending ??= new Map()).set(id, known);
+    if (this.persistedSettledCheck !== undefined) return;
+    this.persistedSettledCheck = this.checkPersistedSettledDropped(persistence).finally(() => {
+      this.persistedSettledCheck = undefined;
+    });
+  }
+
+  private async checkPersistedSettledDropped(persistence: PersistedStore): Promise<void> {
+    // Bound the work by the ids waiting when this check started: one slow stat must not chain into a long loop.
+    const batch = [...(this.persistedSettledPending ?? [])] as [SessionId, string][];
+    for (const [id, known] of batch) {
+      if (this.disposed) return;
+      const droppedAt = await this.persistedRevision(persistence, id);
+      // A stat that reports nothing proves nothing: the row leaves this host's memory either way, but the disk keeps
+      // its row, because an unreadable revision cannot show the row is this host's to remove.
+      if (droppedAt !== undefined && droppedAt !== known) continue;
+      (this.persistedSettledDropped ??= new Map()).set(id, known);
+    }
+    const pending = this.persistedSettledPending;
+    if (pending !== undefined) {
+      for (const [id] of batch) pending.delete(id);
+      if (pending.size === 0) this.persistedSettledPending = undefined;
+    }
+    if (this.persistedSettledDropped !== undefined) this.schedulePersistedSettledSave();
   }
 
   /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */

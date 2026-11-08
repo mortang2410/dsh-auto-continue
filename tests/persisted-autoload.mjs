@@ -67,8 +67,8 @@ function openTurn(events) {
 }
 
 /** Persisted-session service: read-only opens, with counters the tests assert on. */
-function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
-  const state = { lists: 0, opens: [], reads: 0, stats: 0, closes: 0, failuresLeft: listFailures };
+function persistence(records, { listFailures = 0, listGate, openGate, statDelay = {} } = {}) {
+  const state = { lists: 0, opens: [], reads: 0, stats: 0, statted: [], closes: 0, failuresLeft: listFailures };
   return {
     state,
     async list() {
@@ -82,6 +82,10 @@ function persistence(records, { listFailures = 0, listGate, openGate } = {}) {
     },
     async stat(id) {
       state.stats += 1;
+      state.statted.push(id);
+      // A slow backend: the wait happens on the fake clock, so the test decides when it ends.
+      const delay = statDelay[id];
+      if (delay !== undefined) await new Promise((resolve) => setTimeout(resolve, delay));
       const stored = records.get(id);
       return stored === undefined ? undefined : { header: stored.header, revision: stored.revision };
     },
@@ -107,18 +111,27 @@ const hosts = [];
 
 /** One fake host with a persisted store. Services default to an empty archive and a default model. */
 function scenario({
-  sessions = [], overrides = {}, services = {}, resumeError, listFailures, listGate, openGate, hangResume = [], resumeDelay = {},
+  sessions = [], overrides = {}, services = {}, resumeError, listFailures, listGate, openGate, statDelay = {}, hangResume = [], resumeDelay = {},
 } = {}) {
   const records = new Map(sessions.map((item) => [item.header.id, item]));
-  const store = persistence(records, { listFailures, listGate, openGate });
+  const store = persistence(records, { listFailures, listGate, openGate, statDelay });
   const resumes = [];
   const disposals = [];
   const published = [];
+  const subagentSends = [];
   const host = makeHost(overrides, {
     services: {
       workspaceRegistry: { archivedSessionIds: [] },
       agentDefaultModel: { currentSelection: () => ({ provider: 'dp', model: 'dm' }) },
       sessionPersistence: store,
+      subagents: {
+        get active() { return new Set(); },
+        freeSlot() {},
+        async sendMessage(sender, targetId, content, options) {
+          subagentSends.push({ sender: sender?.id, targetId, content, options });
+          return `msg-${subagentSends.length}`;
+        },
+      },
       ...services,
     },
     async resume(options) {
@@ -149,7 +162,7 @@ function scenario({
     },
   });
   hosts.push(host);
-  return { host, resumes, store, records, disposals, published };
+  return { host, resumes, store, records, disposals, published, subagentSends };
 }
 
 /** Run one scenario under a fake clock; disposes every host it created. */
@@ -1135,6 +1148,53 @@ test('T40 a deleted row another host rewrote at a new revision survives', () => 
     }
     const entries = JSON.parse(readFileSync(file, 'utf8')).entries;
     assert.equal(entries.child, 'r9', 'the newer revision another host wrote is kept');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));
+
+/**
+ * T41: dropping a settled row is bookkeeping, so it must never spend the startup window. The disk check that decides
+ * whether a row is really this boot's to remove is a host call, and a slow backend can hold it past the deadline. The
+ * scan must schedule that check instead of waiting for it, or a healthy session listed after the live one loses its
+ * recovery on that boot even though nothing about it is wrong.
+ */
+test('T41 a slow cleanup of a live row does not cost a later session its resume', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  try {
+    const live = record('live', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    // A child the host can continue: its own continuable descriptor, a pinned route, and an open turn.
+    const eligible = record('eligible', log([
+      { type: 'subagent/descriptor', data: { version: 3, mode: 'continuable', provider: 'in-process', label: 'worker', agentProvider: 'dp', agentModel: 'dm' } },
+      requestHeader('dp', 'dm'),
+      turnStart(1),
+      userPrompt(),
+    ]), { origin: 'subagent', parentSession: 'p' });
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { live: live.revision } })}\n`, 'utf8');
+    const boot = scenario({
+      sessions: [live, eligible],
+      overrides: { freshMs: 1000, scanLimit: 2 },
+      // Longer than the whole window: if the scan waits for this the window is gone before `eligible` is listed.
+      statDelay: { live: 1500 },
+    });
+    boot.host.agents.set('live', boot.host.agent('live', live.events));
+    // The child is continued under its parent, which must be live under the same id.
+    const parent = boot.host.agent('p', log([turnStart(1), turnEnd(1, { kind: 'completed' })]));
+    parent.id = 'p';
+    boot.host.agents.set('p', parent);
+    boot.host.start();
+    // Close the window in slices the scan's own poll can run between: one 3 s step would close a 1 s window before
+    // the first pass ever starts, and a later pass must not rescue a resume this boot lost.
+    for (let elapsed = 0; elapsed < 2000; elapsed += 25) await settle(25);
+    assert.deepEqual(boot.subagentSends.map((send) => send.targetId), ['eligible'], 'the eligible child is continued');
+    assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), [], 'and it is never cold-resumed');
+    assert.ok(boot.store.state.statted.includes('live'), 'the live row is still statted to learn its revision');
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;

@@ -2443,25 +2443,39 @@ export class AutoContinueRunner {
   /**
    * Read the revision a dropped row is at on disk, then let the save remove it only at the revision this host settled
    * at. Runs beside the scan, never inside it: the host call may be slow, and the scan's deadline is not the save's
-   * to spend. One check at a time; ids that arrive while one runs wait for the next.
+   * to spend. One check at a time; a batch drains the ids waiting when it started, and ids that arrived meanwhile get
+   * a batch of their own.
    */
   private dropPersistedSettled(persistence: PersistedStore, id: SessionId, known: string): void {
     (this.persistedSettledPending ??= new Map()).set(id, known);
-    if (this.persistedSettledCheck !== undefined) return;
-    this.persistedSettledCheck = this.checkPersistedSettledDropped(persistence).finally(() => {
-      this.persistedSettledCheck = undefined;
-    });
+    this.startPersistedSettledCheck(persistence);
+  }
+
+  private startPersistedSettledCheck(persistence: PersistedStore): void {
+    if (this.persistedSettledCheck !== undefined || this.disposed) return;
+    if (this.persistedSettledPending === undefined) return;
+    this.persistedSettledCheck = this.checkPersistedSettledDropped(persistence)
+      .catch(reportLoaderError)
+      .finally(() => {
+        this.persistedSettledCheck = undefined;
+        // An id that arrived while this batch ran is drained next, never left until some later pass offers it again.
+        if (this.persistedSettledPending !== undefined) this.startPersistedSettledCheck(persistence);
+      });
   }
 
   private async checkPersistedSettledDropped(persistence: PersistedStore): Promise<void> {
-    // Bound the work by the ids waiting when this check started: one slow stat must not chain into a long loop.
+    // Bound each batch by the ids waiting when it starts: one slow stat must not chain into an unbounded loop.
+    // startPersistedSettledCheck's disposed guard sends no new batch after shutdown, and the loop below stops on it.
     const batch = [...(this.persistedSettledPending ?? [])] as [SessionId, string][];
     for (const [id, known] of batch) {
       if (this.disposed) return;
       const droppedAt = await this.persistedRevision(persistence, id);
-      // A stat that reports nothing proves nothing: the row leaves this host's memory either way, but the disk keeps
-      // its row, because an unreadable revision cannot show the row is this host's to remove.
-      if (droppedAt !== undefined && droppedAt !== known) continue;
+      // Shutdown may land while the stat is out. A row recorded after it would schedule a save dispose can no longer
+      // cancel, so the check stops here and leaves the disk as it is.
+      if (this.disposed) return;
+      // Only the revision this host settled at makes the removal its own: a newer revision is another host's verdict,
+      // and an unreadable one proves nothing about a row that may not be this host's to remove.
+      if (droppedAt !== known) continue;
       (this.persistedSettledDropped ??= new Map()).set(id, known);
     }
     const pending = this.persistedSettledPending;

@@ -1224,9 +1224,80 @@ test('T42 a shutdown during the disk check leaves the row alone', () => clocked(
     await settle();
     assert.deepEqual(boot.store.state.statted, ['live'], 'the check started and is waiting on the stat');
     boot.host.dispose();
-    // The stat now settles after dispose, and every timer runs for five early-clock seconds past it.
+    // The stat now settles after dispose. Advance past the save delay a check could schedule and give the
+    // filesystem time to land it, so a write started from the late stat cannot hide behind the assertion.
     await settle(5000);
+    await settle(2100);
+    for (let i = 0; i < 500; i += 1) {
+      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+    }
     assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row is still on disk');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));
+
+/**
+ * T43: two live sessions can both hold a settled row, and the first one's disk check can still be waiting when the
+ * second arrives. A check drains only the ids it saw when it started, so a second batch must follow, or the second row
+ * stays on disk for the cap to evict.
+ */
+test('T43 a row that arrives during a slow check is drained by the next one', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  try {
+    const first = record('first', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    const second = record('second', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { first: 'r1', second: 'r1' } })}\n`, 'utf8');
+    const boot = scenario({ sessions: [first, second], statDelay: { first: 500 } });
+    boot.host.agents.set('first', boot.host.agent('first', first.events));
+    boot.host.agents.set('second', boot.host.agent('second', second.events));
+    boot.host.start();
+    // Long enough for the first stat to return and the next check to finish.
+    for (let elapsed = 0; elapsed < 1500; elapsed += 25) await settle(25);
+    await settle(2100);
+    for (let i = 0; i < 500; i += 1) {
+      if (Object.keys(JSON.parse(readFileSync(file, 'utf8')).entries).length === 0) break;
+      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+    }
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, {}, 'both live rows leave the file');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));
+
+/**
+ * T44: the backend cannot report a revision (no stat at all, or one that fails). An unknown revision proves nothing
+ * about the disk row, so the row stays: only a revision that equals the one this host settled at makes the removal
+ * this host's to make.
+ */
+test('T44 a row whose revision cannot be read stays on disk', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  try {
+    const live = record('live', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { live: 'r1' } })}\n`, 'utf8');
+    const boot = scenario({ sessions: [live] });
+    // A backend with no stat at all: persistedRevision answers undefined.
+    delete boot.store.stat;
+    boot.host.agents.set('live', boot.host.agent('live', live.events));
+    boot.host.start();
+    await settle();
+    await settle(2100);
+    for (let i = 0; i < 500; i += 1) {
+      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+    }
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row another host may own is kept');
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;

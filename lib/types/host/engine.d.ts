@@ -321,9 +321,11 @@ export declare class AutoContinueRunner {
     /**
      * Read the revision a dropped row is at on disk, then let the save remove it only at the revision this host settled
      * at. Runs beside the scan, never inside it: the host call may be slow, and the scan's deadline is not the save's
-     * to spend. One check at a time; ids that arrive while one runs wait for the next.
+     * to spend. One check at a time; a batch drains the ids waiting when it started, and ids that arrived meanwhile get
+     * a batch of their own.
      */
     private dropPersistedSettled;
+    private startPersistedSettledCheck;
     private checkPersistedSettledDropped;
     /** Resume at most `scanLimit` queued sessions in this pass, one awaited load at a time. */
     private resumeQueuedPersisted;

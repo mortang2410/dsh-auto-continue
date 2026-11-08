@@ -1204,46 +1204,54 @@ test('T41 a slow cleanup of a live row does not cost a later session its resume'
 }));
 
 /**
- * T42: the disk check runs beside the scan, so a shutdown can land while its stat is still out. That must leave the
- * file exactly as it was: no save runs, and the row keeps its revision, so the next boot sees a settled row rather
- * than one deleted by a drop that never finished.
+ * T42: the disk check runs beside the scan, so a shutdown can land while its stat is still out. A save scheduled after
+ * dispose is one dispose cannot cancel, and it would write a drop this host no longer runs to justify, so the file must
+ * come through the shutdown untouched.
+ *
+ * This test runs on real timers on purpose. Under the fake clock the same scenario pins nothing: the stat delay and
+ * the 10 s call timeout are both suspended when the host is disposed, so a save armed afterwards never fires and the
+ * file looks intact either way. With real timers it would fire 2 s later, inside the wait below.
+ *
+ * Known limit: with the post-stat shutdown guard removed, this test still passes, because the check does not reach
+ * its save in this scenario either way. It documents the shutdown case; it does not pin the guard.
  */
-test('T42 a shutdown during the disk check leaves the row alone', () => clocked(async () => {
+test('T42 a shutdown during the disk check writes nothing', async () => {
   const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
   const file = join(home, 'auto-continue-settled.json');
+  const realWait = (ms) => new Promise((resolve) => { realSetTimeout(resolve, ms); });
   try {
     const live = record('live', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
     writeFileSync(file, `${JSON.stringify({ version: 1, entries: { live: live.revision } })}\n`, 'utf8');
-    // The stat takes exactly as long as the scan needs to finish, so it settles one tick after dispose.
-    const boot = scenario({ sessions: [live], statDelay: { live: 1 } });
+    // The stat waits on a real timer the test controls, so dispose lands while it is still out.
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const boot = scenario({ sessions: [live] });
+    const answered = boot.store.stat.bind(boot.store);
+    boot.store.stat = async (id) => {
+      boot.store.state.stats += 1;
+      boot.store.state.statted.push(id);
+      await gate;
+      return answered(id);
+    };
     boot.host.agents.set('live', boot.host.agent('live', live.events));
     boot.host.start();
-    // Let the scan reach the slow stat, then dispose while it is still out.
-    await settle();
+    for (let i = 0; i < 200 && !boot.store.state.statted.includes('live'); i += 1) await realWait(5);
     assert.deepEqual(boot.store.state.statted, ['live'], 'the check started and is waiting on the stat');
     boot.host.dispose();
-    // The stat now settles after dispose. Advance past the save delay a check could schedule and give the
-    // filesystem time to land it, so a write started from the late stat cannot hide behind the assertion.
-    await settle(5000);
-    await settle(2100);
-    // Real time, so the filesystem can land any write the late stat started: poll until the file is stable.
-    let seen = readFileSync(file, 'utf8');
-    for (let i = 0; i < 200; i += 1) {
-      await new Promise((resolve) => { realSetTimeout(resolve, 10); });
-      const now = readFileSync(file, 'utf8');
-      if (now !== seen) break;
-      seen = now;
-    }
-    assert.deepEqual(JSON.parse(seen).entries, { live: 'r1' }, 'the row is still on disk');
+    release();
+    // A save armed by the late stat fires on the real timer 2 s from now.
+    await realWait(2100);
+    for (let i = 0; i < 20; i += 1) await realWait(10);
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row is still on disk');
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;
     for (const host of hosts.splice(0)) host.dispose();
     await rm(home, { recursive: true, force: true });
   }
-}));
+});
 
 /**
  * T43: two live sessions can both hold a settled row, and the first one's disk check can still be waiting when the

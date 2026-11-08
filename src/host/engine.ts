@@ -762,9 +762,15 @@ export class AutoContinueRunner {
   /**
    * A log whose first read stalled this boot, and that a later pass has to read once more. Enumeration is otherwise
    * once per boot, so without this a stall inside a completed enumeration was never retried and the log line said it
-   * would be. The id leaves the set when the owed read starts, so a retry that stalls again asks for nothing more.
+   * would be. The id leaves the set when the owed read starts and moves to persistedRetried.
    */
   private readonly persistedStalled = new Set<SessionId>();
+  /**
+   * A log whose one retry this boot has started, whichever way that read then went. A retry that yields nothing to
+   * resume leaves nothing else behind, so without this the next pass, started for another log's stall, would read it
+   * as a fresh candidate and open it a third time.
+   */
+  private readonly persistedRetried = new Set<SessionId>();
   private readonly persistedDecided = new Set<SessionId>();
   /**
    * Session id to the artifact revision that failed to read, kept across restarts so a boot does not decode a log it
@@ -2447,11 +2453,14 @@ export class AutoContinueRunner {
       }
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
+      // A log whose retry this boot has already started is read by no later pass, whatever that retry returned: a
+      // retry that yielded nothing to resume would otherwise look like a fresh candidate on a pass another log's stall
+      // starts, and the log line would promise a retry it already had.
+      if (this.persistedRetried.has(header.id)) continue;
       // A log whose read stalled on an earlier pass is read once more before the revision bookkeeping below can skip
-      // it, because a stall decides nothing about the log. The retry is owed by the id being in the set, and it is
-      // spent whatever the retry does: a read that yields a turn, a read that yields nothing, and a stall all take
-      // the id out, so no later pass reads the log again and the scan can finish enumerating.
+      // it, because a stall decides nothing about the log. The retry is spent by starting, whichever way it then goes.
       if (this.persistedStalled.delete(header.id)) {
+        this.persistedRetried.add(header.id);
         const retried = await this.readPersistedEntry(persistence, header, now, config, { settled: false, retrySpent: true });
         if (retried !== undefined) queue.push(retried);
         continue;

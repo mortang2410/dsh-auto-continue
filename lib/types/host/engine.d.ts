@@ -89,9 +89,15 @@ export declare class AutoContinueRunner {
     /**
      * A log whose first read stalled this boot, and that a later pass has to read once more. Enumeration is otherwise
      * once per boot, so without this a stall inside a completed enumeration was never retried and the log line said it
-     * would be. The id leaves the set when the owed read starts, so a retry that stalls again asks for nothing more.
+     * would be. The id leaves the set when the owed read starts and moves to persistedRetried.
      */
     private readonly persistedStalled;
+    /**
+     * A log whose one retry this boot has started, whichever way that read then went. A retry that yields nothing to
+     * resume leaves nothing else behind, so without this the next pass, started for another log's stall, would read it
+     * as a fresh candidate and open it a third time.
+     */
+    private readonly persistedRetried;
     private readonly persistedDecided;
     /**
      * Session id to the artifact revision that failed to read, kept across restarts so a boot does not decode a log it

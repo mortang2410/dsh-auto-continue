@@ -2358,9 +2358,10 @@ export class AutoContinueRunner {
 
   /** The artifact's own revision, or undefined when the backend cannot report one cheaply. */
   private async persistedRevision(persistence: PersistedStore, id: SessionId): Promise<string | undefined> {
-    const stat = persistence.stat;
-    if (stat === undefined) return undefined;
     try {
+      // The accessor itself can throw: a backend whose stat is a getter that faults must read as unknown, not escape.
+      const stat = persistence.stat;
+      if (stat === undefined) return undefined;
       const observed = await withPersistedTimeout(stat.call(persistence, id));
       const revision = observed?.revision;
       return revision === undefined || revision === null ? undefined : String(revision);
@@ -2453,35 +2454,47 @@ export class AutoContinueRunner {
 
   private startPersistedSettledCheck(persistence: PersistedStore): void {
     if (this.persistedSettledCheck !== undefined || this.disposed) return;
-    if (this.persistedSettledPending === undefined) return;
-    this.persistedSettledCheck = this.checkPersistedSettledDropped(persistence)
+    const waiting = this.persistedSettledPending;
+    if (waiting === undefined) return;
+    // Progress is counted by the batch itself: an id that arrives while it runs leaves the size unchanged, so a size
+    // comparison would read that arrival as no progress.
+    const progress = { drained: 0 };
+    this.persistedSettledCheck = this.checkPersistedSettledDropped(persistence, progress)
       .catch(reportLoaderError)
       .finally(() => {
         this.persistedSettledCheck = undefined;
         // An id that arrived while this batch ran is drained next, never left until some later pass offers it again.
-        if (this.persistedSettledPending !== undefined) this.startPersistedSettledCheck(persistence);
+        // The restart needs progress: a batch that threw before draining anything would otherwise rerun without pause.
+        if (progress.drained > 0 && this.persistedSettledPending !== undefined) this.startPersistedSettledCheck(persistence);
       });
   }
 
-  private async checkPersistedSettledDropped(persistence: PersistedStore): Promise<void> {
+  private async checkPersistedSettledDropped(persistence: PersistedStore, progress: { drained: number }): Promise<void> {
     // Bound each batch by the ids waiting when it starts: one slow stat must not chain into an unbounded loop.
-    // startPersistedSettledCheck's disposed guard sends no new batch after shutdown, and the loop below stops on it.
+    // startPersistedSettledCheck's disposed guard sends no new batch after shutdown, and the loop comments below stop on it.
     const batch = [...(this.persistedSettledPending ?? [])] as [SessionId, string][];
-    for (const [id, known] of batch) {
-      if (this.disposed) return;
-      const droppedAt = await this.persistedRevision(persistence, id);
-      // Shutdown may land while the stat is out. A row recorded after it would schedule a save dispose can no longer
-      // cancel, so the check stops here and leaves the disk as it is.
-      if (this.disposed) return;
-      // Only the revision this host settled at makes the removal its own: a newer revision is another host's verdict,
-      // and an unreadable one proves nothing about a row that may not be this host's to remove.
-      if (droppedAt !== known) continue;
-      (this.persistedSettledDropped ??= new Map()).set(id, known);
-    }
-    const pending = this.persistedSettledPending;
-    if (pending !== undefined) {
-      for (const [id] of batch) pending.delete(id);
-      if (pending.size === 0) this.persistedSettledPending = undefined;
+    const checked: SessionId[] = [];
+    try {
+      for (const [id, known] of batch) {
+        if (this.disposed) return;
+        const droppedAt = await this.persistedRevision(persistence, id);
+        // Shutdown may land while the stat is out. A row recorded after it would schedule a save dispose can no longer
+        // cancel, so the check stops here and leaves the disk as it is.
+        if (this.disposed) return;
+        checked.push(id);
+        // Only the revision this host settled at makes the removal its own: a newer revision is another host's verdict,
+        // and an unreadable one proves nothing about a row that may not be this host's to remove.
+        if (droppedAt !== known) continue;
+        (this.persistedSettledDropped ??= new Map()).set(id, known);
+      }
+    } finally {
+      // Whatever this batch did check leaves the pending map, even when a stat threw: the restart count stays honest.
+      if (checked.length > 0) progress.drained += checked.length;
+      const pending = this.persistedSettledPending;
+      if (pending !== undefined) {
+        for (const id of checked) pending.delete(id);
+        if (pending.size === 0) this.persistedSettledPending = undefined;
+      }
     }
     if (this.persistedSettledDropped !== undefined) this.schedulePersistedSettledSave();
   }

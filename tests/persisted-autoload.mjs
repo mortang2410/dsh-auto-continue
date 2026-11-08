@@ -1228,10 +1228,15 @@ test('T42 a shutdown during the disk check leaves the row alone', () => clocked(
     // filesystem time to land it, so a write started from the late stat cannot hide behind the assertion.
     await settle(5000);
     await settle(2100);
-    for (let i = 0; i < 500; i += 1) {
+    // Real time, so the filesystem can land any write the late stat started: poll until the file is stable.
+    let seen = readFileSync(file, 'utf8');
+    for (let i = 0; i < 200; i += 1) {
       await new Promise((resolve) => { realSetTimeout(resolve, 10); });
+      const now = readFileSync(file, 'utf8');
+      if (now !== seen) break;
+      seen = now;
     }
-    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row is still on disk');
+    assert.deepEqual(JSON.parse(seen).entries, { live: 'r1' }, 'the row is still on disk');
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;
@@ -1294,10 +1299,48 @@ test('T44 a row whose revision cannot be read stays on disk', () => clocked(asyn
     boot.host.start();
     await settle();
     await settle(2100);
+    // Real time for a save to land if one were started; a correct run starts none.
+    await new Promise((resolve) => { realSetTimeout(resolve, 50); });
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row another host may own is kept');
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+    for (const host of hosts.splice(0)) host.dispose();
+    await rm(home, { recursive: true, force: true });
+  }
+}));
+
+/**
+ * T45: a backend whose stat accessor throws, rather than reporting nothing. The check must treat that as an unknown
+ * revision (keep the row) and must not retry without pause: a restart loop on an unchanged pending set spins the host
+ * for as long as the fault lasts.
+ */
+test('T45 a throwing stat accessor neither spins nor removes the row', () => clocked(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'ac-settled-'));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  const file = join(home, 'auto-continue-settled.json');
+  try {
+    const live = record('live', log([turnStart(1), turnEnd(1, INTERRUPTED)]), { origin: 'subagent', parentSession: 'p' });
+    writeFileSync(file, `${JSON.stringify({ version: 1, entries: { live: 'r1' } })}\n`, 'utf8');
+    const boot = scenario({ sessions: [live] });
+    let reads = 0;
+    // The accessor itself throws: persistedRevision never gets a stat to call.
+    Object.defineProperty(boot.store, 'stat', {
+      get() {
+        reads += 1;
+        throw new Error('backend unavailable');
+      },
+    });
+    boot.host.agents.set('live', boot.host.agent('live', live.events));
+    boot.host.start();
+    await settle();
+    await settle(2100);
     for (let i = 0; i < 500; i += 1) {
       await new Promise((resolve) => { realSetTimeout(resolve, 10); });
     }
-    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'the row another host may own is kept');
+    assert.ok(reads <= 2, `one attempt, not a spin (read the accessor ${reads} times)`);
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'an unknown revision keeps the row');
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;

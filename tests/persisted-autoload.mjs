@@ -1347,6 +1347,8 @@ test('T45 a throwing stat accessor neither spins nor removes the row', () => clo
     for (let i = 0; i < 500; i += 1) {
       await new Promise((resolve) => { realSetTimeout(resolve, 10); });
     }
+    // Both bounds matter: zero reads would mean the cleanup never ran, which is not the behaviour under test.
+    assert.ok(reads >= 1, `the cleanup tried the accessor ${reads} times`);
     assert.ok(reads <= 2, `one attempt, not a spin (read the accessor ${reads} times)`);
     assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).entries, { live: 'r1' }, 'an unknown revision keeps the row');
   } finally {

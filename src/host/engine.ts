@@ -2446,8 +2446,10 @@ export class AutoContinueRunner {
       }
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
-      // A log whose read stalled on an earlier pass is read before the revision bookkeeping below can skip it: the
-      // stall decided nothing about this log, and the pass that saw it promised to read it again.
+      // A log whose read stalled on an earlier pass is read once more before the revision bookkeeping below can skip
+      // it, because a stall decides nothing about the log. Only once: a log that stalls again costs a full decode that
+      // may never settle, and retrying it on every pass spends the window on the same few logs while the sessions after
+      // them are never reached. A log still stalled when the scan ends is read again on the next boot.
       if (this.persistedStalled.has(header.id)) {
         const retried = await this.readPersistedEntry(persistence, header, now, config, { settled: false });
         if (retried !== undefined) queue.push(retried);
@@ -2650,9 +2652,13 @@ export class AutoContinueRunner {
       // is read here, once, rather than for every row up front.
       const stalled = error instanceof PersistedCallTimeout;
       if (stalled) {
-        // Remembered so the next pass reads this log again: enumeration otherwise runs once per boot, and the log line
-        // below tells the operator it will be retried.
-        this.persistedStalled.add(header.id);
+        // A first stall is remembered so the next pass reads this log again. A second stall is terminal for this boot,
+        // so the memory goes: enumeration then carries on instead of starting over for a log that has not settled twice.
+        if (this.persistedStalled.has(header.id)) {
+          this.persistedStalled.delete(header.id);
+        } else {
+          this.persistedStalled.add(header.id);
+        }
       } else {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined) {
@@ -2661,12 +2667,16 @@ export class AutoContinueRunner {
           this.schedulePersistedRejectionSave();
         }
       }
-      // A stall and an unreadable log are different facts for the operator: the first is retried next pass, the
-      // second is remembered until the bytes change. One line for both told the operator the log was unreadable.
+      // A stall and an unreadable log are different facts for the operator: the first was retried, the second is
+      // remembered until the bytes change. One line for both told the operator the log was unreadable.
       console.error(
-        `[auto-continue] ${stalled ? '本次跳过读取超时的持久化会话, 下一轮重试' : '跳过无法读取的持久化会话'} ${header.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `[auto-continue] ${
+          stalled
+            ? this.persistedStalled.has(header.id)
+              ? '本次跳过读取超时的持久化会话, 下一轮重试'
+              : '持久化会话再次读取超时, 本次启动不再重试, 下次启动再读'
+            : '跳过无法读取的持久化会话'
+        } ${header.id}: ${error instanceof Error ? error.message : String(error)}`,
       );
       return undefined;
     }

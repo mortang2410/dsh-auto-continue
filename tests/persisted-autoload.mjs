@@ -1412,3 +1412,29 @@ test('T48 a log that stalls on one pass is read again on the next', () => clocke
   assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['stalled'], 'the next pass reads the log and resumes it');
   assert.equal(opens, 2, 'the log is opened again rather than skipped as settled or unreadable');
 }));
+
+/**
+ * T49: a log that stalls twice stops being retried, so the scan moves past it. persistedStalled asks for another pass
+ * after a first stall; when the second read stalls too and the id stays in that set, enumeration starts over on the
+ * next pass, and a log that never settles is decoded again every couple of passes for the rest of the boot. Here the
+ * stalled log is listed first and never settles while the session behind it reads normally, so the count of its opens
+ * is the whole claim: one summary attempt, one retry, and nothing after that.
+ */
+test('T49 a log that stalls twice is not retried for the rest of the boot', () => clocked(async () => {
+  const stalled = record('stalled', log(OPEN()));
+  const ready = record('ready', log(OPEN()));
+  const boot = scenario({ sessions: [stalled, ready], overrides: { freshMs: 60_000 } });
+  const realOpen = boot.store.open.bind(boot.store);
+  let opens = 0;
+  boot.store.open = async (id, access) => {
+    const handle = await realOpen(id, access);
+    if (id !== 'stalled') return handle;
+    opens += 1;
+    return { ...handle, read: () => new Promise(() => {}) };
+  };
+  boot.host.start();
+  await settle();
+  for (let pass = 0; pass < 6; pass += 1) await nextPass();
+  assert.equal(opens, 2, 'the stalled log is opened once, retried once, and not opened again');
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['ready'], 'the session behind it is resumed');
+}));

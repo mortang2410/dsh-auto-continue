@@ -1360,11 +1360,12 @@ test('T45 a throwing stat accessor neither spins nor removes the row', () => clo
 }));
 
 /**
- * T47: one stalled log must not cost every other session its recovery. A session queued before the stall is resumed
- * in the same pass, or by the next one, instead of waiting for an enumeration that never finishes. The stall is a
- * read that never settles, so the pass has to move past it rather than wait for its 10 s call budget.
+ * T47: a stalled log costs its own turn, not the rest of the pass. The stalled session is listed first, so the healthy
+ * one behind it is reached only if the scan abandons the stall inside its own call budget and moves on. The stall is an
+ * open that never settles, so the pass has to move past it rather than wait for the 10 s budget a resume call keeps.
+ * The stall is abandoned, not recovered: what becomes of a log that stalled is T48.
  */
-test('T47 a stalled log does not stop an already-queued session from resuming', () => clocked(async () => {
+test('T47 a stalled log does not cost the sessions listed behind it their recovery', () => clocked(async () => {
   const stalled = record('stalled', log(OPEN()));
   const ready = record('ready', log(OPEN()));
   const boot = scenario({
@@ -1386,9 +1387,9 @@ test('T47 a stalled log does not stop an already-queued session from resuming', 
 }));
 
 /**
- * T48: a log that stalls is read again on a later pass, so the line that says it will be retried is true. Enumeration
- * runs once per boot, so a stall inside a completed enumeration used to drop the session for the whole window while
- * the log still told the operator it would be retried. Here the first read never settles inside its budget and the
+ * T48: a log that stalls is read again on a later pass, so the line that says it will be retried is true. A read that
+ * times out leaves the log's eligibility undecided, and persistedStalled carries its id into the next enumeration;
+ * without that the session waits out the whole boot window. Here the first read never settles inside its budget and the
  * read after it is ordinary, so the second pass must resume that session.
  */
 test('T48 a log that stalls on one pass is read again on the next', () => clocked(async () => {

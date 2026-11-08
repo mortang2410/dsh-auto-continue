@@ -2447,9 +2447,8 @@ export class AutoContinueRunner {
       if (header.cwd === undefined) continue;
       if (sweepOwnsRoots && header.origin !== 'subagent') continue;
       // A log whose read stalled on an earlier pass is read once more before the revision bookkeeping below can skip
-      // it, because a stall decides nothing about the log. Only once: a log that stalls again costs a full decode that
-      // may never settle, and retrying it on every pass spends the window on the same few logs while the sessions after
-      // them are never reached. A log still stalled when the scan ends is read again on the next boot.
+      // it, because a stall decides nothing about the log. That retry reads the log or stalls again; either way the
+      // retry set is then empty for it.
       if (this.persistedStalled.has(header.id)) {
         const retried = await this.readPersistedEntry(persistence, header, now, config, { settled: false });
         if (retried !== undefined) queue.push(retried);
@@ -2595,6 +2594,10 @@ export class AutoContinueRunner {
           ownEvents = events.slice(inherited);
         }
         const lastActivityAt = persistedLastActivity(ownEvents, now, config);
+        // The log read this time, so nothing is owed to a later pass for it, whether or not it holds a turn to resume.
+        // A read that ends here without a resume used to leave the id in the retry set, and every later pass read it
+        // again while the scan could never finish enumerating.
+        this.persistedStalled.delete(header.id);
         if (lastActivityAt === undefined) return undefined;
         let lastEnd: SessionEvent<'turn/end'> | undefined;
         for (let i = ownEvents.length - 1; i >= 0; i -= 1) {
@@ -2634,7 +2637,6 @@ export class AutoContinueRunner {
           if (rejections.delete(header.id)) this.schedulePersistedRejectionSave();
         }
         // The log read, so nothing is owed to a later pass for it.
-        this.persistedStalled.delete(header.id);
         return {
           id: header.id,
           lastActivityAt,
@@ -2652,13 +2654,9 @@ export class AutoContinueRunner {
       // is read here, once, rather than for every row up front.
       const stalled = error instanceof PersistedCallTimeout;
       if (stalled) {
-        // A first stall is remembered so the next pass reads this log again. A second stall is terminal for this boot,
-        // so the memory goes: enumeration then carries on instead of starting over for a log that has not settled twice.
-        if (this.persistedStalled.has(header.id)) {
-          this.persistedStalled.delete(header.id);
-        } else {
-          this.persistedStalled.add(header.id);
-        }
+        // A first stall asks for one retry on the next pass. A second stall asks for nothing more: the retry set
+        // empties, so the scan stops re-enumerating and the log waits for the next boot.
+        if (!this.persistedStalled.delete(header.id)) this.persistedStalled.add(header.id);
       } else {
         const revision = await this.persistedRevision(persistence, header.id);
         if (revision !== undefined) {

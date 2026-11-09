@@ -1500,32 +1500,36 @@ test('T51 a retried stall does not reopen the log beside it', () => clocked(asyn
 }));
 
 /**
- * T52: a log whose retry came back with nothing to resume is not read again by any later pass of the same boot. Two
- * logs are involved. The first stalls on its first read and is owed a retry; the second is settled, so its first read
- * resumes nothing. The second pass spends the first log's retry, which also resumes nothing, and stalls on the second
- * log's retry, so a third pass runs. That third pass is where the first log used to be opened a third time. The
- * spent-retry set keeps it out of the scan, and the third pass shows as a second read of the log whose retry stalled.
+ * T52: a log whose retry is spent is not read again in the same boot, even when another log's stall starts a later
+ * pass. The first (retry) stalls on its first read, so the next pass owes it a retry. The retry reads an interrupted
+ * turn and the host refuses that resume, so the log is live nowhere and would read as an ordinary candidate later.
+ * The second (waiter) resumes nothing, then stalls in its own retry, which starts the pass that used to read the first
+ * log a third time. That pass probes both halves of the fix: with the retry forgotten the first log is an ordinary
+ * candidate, and with it forgotten but only the guard removed the first log takes the retry branch anyway.
  */
-test('T52 a log whose retry resumes nothing is not read again in the same boot', () => withHome(async () => clocked(async () => {
+test('T52 a spent retry is not followed by a fresh read of the same log', () => withHome(async () => clocked(async () => {
   const now = Date.now();
-  const empty = record('empty', log(OPEN(), now - 1000));
-  const other = record('other', log([turnStart(1), turnEnd(1, { kind: 'completed' })], now));
-  const boot = scenario({ sessions: [empty, other], overrides: { freshMs: 600_000 } });
+  const retry = record('retry', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'aborted', reason: { kind: 'disposed' } })], now));
+  const waiter = record('waiter', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'completed' })], now));
+  const boot = scenario({ sessions: [retry, waiter], overrides: { freshMs: 600_000 }, listFailures: 1, resumeError: new Error('refused') });
   const realOpen = boot.store.open.bind(boot.store);
-  const opens = { empty: 0, other: 0 };
+  const opens = { retry: 0, waiter: 0 };
   boot.store.open = async (id, access) => {
     const handle = await realOpen(id, access);
     opens[id] += 1;
-    // The first log stalls on its only candidate read and then reads cleanly when its retry comes.
-    if (id === 'empty' && opens.empty === 1) return { ...handle, read: () => new Promise(() => {}) };
-    // The second log reads cleanly once and stalls on the retry its pass owes it, which is what starts a third pass.
-    if (id === 'other' && opens.other > 1) return { ...handle, read: () => new Promise(() => {}) };
+    // The first log stalls on its first read and then reads cleanly when its retry comes.
+    if (id === 'retry' && opens.retry === 1) return { ...handle, read: () => new Promise(() => {}) };
+    // The waiter reads cleanly once and stalls on the retry its pass owes it, which starts the next pass.
+    if (id === 'waiter' && opens.waiter === 2) return { ...handle, read: () => new Promise(() => {}) };
     return handle;
   };
   boot.host.start();
   await settle();
-  for (let pass = 0; pass < 5; pass += 1) await nextPass();
-  assert.equal(opens.empty, 2, 'the first log is read once as a candidate and once as its retry, and no later pass reads it');
-  assert.equal(opens.other, 3, 'the second log reads once as a candidate, stalls in its retry, and is read again by the pass that retry starts');
-  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['empty'], 'only the first log holds a turn to resume');
+  for (let pass = 0; pass < 6; pass += 1) await nextPass();
+  assert.equal(opens.retry, 2, 'the first log is read as a candidate and once as its retry, and the later pass leaves it alone');
+  assert.equal(opens.waiter, 3, 'the waiter reads as a candidate, resumes nothing, stalls in its retry, and the pass that retry starts reads it once more');
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['retry'], 'only the first log holds a turn to resume, and the host refuses that resume');
 })));
+// The two halves of the spent-retry fix need separate mutants. Removing the add leaves the guard true for no log, so
+// the pass above reads the first log again and opens.retry reaches 3; removing the guard lets that same pass take the
+// retry branch, whose read of a log no longer stalled is a third read too. Each mutant fails this test on its own.

@@ -1503,23 +1503,26 @@ test('T51 a retried stall does not reopen the log beside it', () => clocked(asyn
  * T52: a log whose retry is spent is not read again in the same boot, even when another log's stall starts a later
  * pass. The first (retry) stalls on its first read, so the next pass owes it a retry. The retry reads an interrupted
  * turn and the host refuses that resume, so the log is live nowhere and would read as an ordinary candidate later.
- * The second (waiter) resumes nothing, then stalls in its own retry, which starts the pass that used to read the first
- * log a third time. That pass probes both halves of the fix: with the retry forgotten the first log is an ordinary
- * candidate, and with it forgotten but only the guard removed the first log takes the retry branch anyway.
+ * The second (waiter) resumes nothing, is read a second time as an ordinary candidate, and stalls there, which starts
+ * the pass that used to read the first log a third time.
+ * The refused resume is what makes the test bite: a log resumed successfully is live, and the live check skips it on
+ * every pass whether or not the spent retry is remembered.
+ *
+ * A completed-turn root is only proved resumable to be skipped, so it is read again on each pass that enumerates. The
+ * six passes below are one more than the run needs; fewer than five stop before the pass the test is about.
  */
 test('T52 a spent retry is not followed by a fresh read of the same log', () => withHome(async () => clocked(async () => {
   const now = Date.now();
-  const retry = record('retry', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'aborted', reason: { kind: 'disposed' } })], now));
+  const interrupted = { kind: 'aborted', reason: { kind: 'disposed' } };
+  const retry = record('retry', log([turnStart(1), userPrompt(), turnEnd(1, interrupted)], now));
   const waiter = record('waiter', log([turnStart(1), userPrompt(), turnEnd(1, { kind: 'completed' })], now));
-  const boot = scenario({ sessions: [retry, waiter], overrides: { freshMs: 600_000 }, listFailures: 1, resumeError: new Error('refused') });
+  const boot = scenario({ sessions: [retry, waiter], overrides: { freshMs: 600_000 }, resumeError: new Error('refused') });
   const realOpen = boot.store.open.bind(boot.store);
   const opens = { retry: 0, waiter: 0 };
   boot.store.open = async (id, access) => {
     const handle = await realOpen(id, access);
     opens[id] += 1;
-    // The first log stalls on its first read and then reads cleanly when its retry comes.
     if (id === 'retry' && opens.retry === 1) return { ...handle, read: () => new Promise(() => {}) };
-    // The waiter reads cleanly once and stalls on the retry its pass owes it, which starts the next pass.
     if (id === 'waiter' && opens.waiter === 2) return { ...handle, read: () => new Promise(() => {}) };
     return handle;
   };
@@ -1527,9 +1530,9 @@ test('T52 a spent retry is not followed by a fresh read of the same log', () => 
   await settle();
   for (let pass = 0; pass < 6; pass += 1) await nextPass();
   assert.equal(opens.retry, 2, 'the first log is read as a candidate and once as its retry, and the later pass leaves it alone');
-  assert.equal(opens.waiter, 3, 'the waiter reads as a candidate, resumes nothing, stalls in its retry, and the pass that retry starts reads it once more');
-  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['retry'], 'only the first log holds a turn to resume, and the host refuses that resume');
+  assert.equal(opens.waiter, 3, 'the waiter is read, skipped as nothing to resume, read again, stalls, and its retry opens it once more');
+  assert.deepEqual(boot.resumes.map((entry) => entry.resumeSessionId), ['retry'], 'only the first log holds a turn to resume, and the host refuses it');
 })));
-// The two halves of the spent-retry fix need separate mutants. Removing the add leaves the guard true for no log, so
-// the pass above reads the first log again and opens.retry reaches 3; removing the guard lets that same pass take the
-// retry branch, whose read of a log no longer stalled is a third read too. Each mutant fails this test on its own.
+// Each half of the fix is caught on its own as an ordinary read, because a log no longer stalled never enters the
+// retry branch. Removing the add leaves the guard true for nothing too, so the guard has to be read as the only skip
+// that survives on its own: the third open of the first log is the pass that reads it as a candidate.
